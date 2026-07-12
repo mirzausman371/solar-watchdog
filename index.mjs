@@ -72,6 +72,15 @@ const CFG = {
 
   // Dashboard password (empty = open; REQUIRED before any public deploy)
   DASH_PASSWORD: process.env.DASH_PASSWORD || "",
+
+  // Tuya Cloud — TOMZN whole-house energy breaker (real grid measurement)
+  TUYA_ID: process.env.TUYA_ACCESS_ID || "",
+  TUYA_SECRET: process.env.TUYA_ACCESS_SECRET || "",
+  TUYA_DEVICE: process.env.TUYA_DEVICE_ID || "",
+  TUYA_REGION: process.env.TUYA_REGION || "eu",   // us | eu | cn | in (your Smart Life account's data center)
+  TUYA_ROLE: process.env.TUYA_ROLE || "grid",     // grid = breaker measures WAPDA import; house = total consumption
+  TUYA_KWH_SCALE: num(process.env.TUYA_KWH_SCALE, 100),   // raw→kWh divisor (TOMZN usually 100); calibrate on first read
+  TUYA_KWH_FILE: process.env.TUYA_KWH_FILE || join(DIR, "tuya.json"),
   HTTP_PORT: num(process.env.HTTP_PORT, 8080), // 0 disables the dashboard
   PUBLIC_URL: (process.env.PUBLIC_URL || "https://solar.skillmatch.tech").replace(/\/+$/, ""),
 };
@@ -94,7 +103,8 @@ function loadJson(f, fallback) { if (existsSync(f)) { try { return JSON.parse(re
 function saveJson(f, o) { writeFileSync(f, JSON.stringify(o, null, 2)); }
 function freshDay(date) {
   return { date, pvWh: 0, expPvWh: 0, loadWh: 0, dischargeWh: 0, chargeWh: 0, curtWh: 0,
-           gridWh: 0, meterGridWh: {}, socMin: 100, socMax: 0, gridOutStart: null,
+           gridWh: 0, meterGridWh: {}, gridMeasWh: 0, meterMeasWh: {},
+           socMin: 100, socMax: 0, gridOutStart: null,
            lastAlerts: {}, digestSent: false, forecastSent: false };
 }
 function freshProfile() { return { hourlyLoadW: Array(24).fill(0), seen: Array(24).fill(0) }; }
@@ -189,6 +199,89 @@ async function dessDataUrl() {
   const action = `&action=querySPDeviceLastData&${deviceParams()}${DESS_APP}`;
   const sign = sha1(salt + dessAuth.secret + dessAuth.token + action);
   return `${DESS_BASE}?sign=${sign}&salt=${salt}&token=${dessAuth.token}${action}`;
+}
+
+// ---------- TUYA CLOUD (TOMZN energy breaker) ----------
+// OpenAPI HMAC-SHA256 scheme: token sign = id+t+stringToSign;
+// business sign = id+access_token+t+stringToSign.
+const TUYA_HOSTS = { us: "https://openapi.tuyaus.com", eu: "https://openapi.tuyaeu.com",
+  cn: "https://openapi.tuyacn.com", in: "https://openapi.tuyain.com" };
+const TUYA_EMPTY_SHA = createHash("sha256").update("").digest("hex");
+const tuyaHost = () => TUYA_HOSTS[CFG.TUYA_REGION] || TUYA_HOSTS.eu;
+const tuyaSign = (str) => createHmac("sha256", CFG.TUYA_SECRET).update(str).digest("hex").toUpperCase();
+let tuyaAuth = { token: null, expireAt: 0 };
+let tuyaRawLogged = false;
+
+async function tuyaToken() {
+  const t = Date.now().toString();
+  const path = "/v1.0/token?grant_type=1";
+  const strToSign = `GET\n${TUYA_EMPTY_SHA}\n\n${path}`;
+  const sign = tuyaSign(CFG.TUYA_ID + t + strToSign);
+  const res = await fetch(tuyaHost() + path, {
+    headers: { client_id: CFG.TUYA_ID, sign, t, sign_method: "HMAC-SHA256" },
+    signal: AbortSignal.timeout(15000),
+  });
+  const j = await res.json();
+  if (!j.success) throw new Error(`Tuya token err ${j.code}: ${j.msg}`);
+  tuyaAuth = { token: j.result.access_token, expireAt: Date.now() + (j.result.expire_time - 60) * 1000 };
+  console.log(`Tuya: authenticated (${CFG.TUYA_REGION}), token valid ${Math.round(j.result.expire_time / 60)}m`);
+}
+
+async function tuyaStatus() {
+  if (!CFG.TUYA_ID || !CFG.TUYA_DEVICE) return null;
+  if (!tuyaAuth.token || Date.now() > tuyaAuth.expireAt) await tuyaToken();
+  const t = Date.now().toString();
+  const path = `/v1.0/devices/${CFG.TUYA_DEVICE}/status`;
+  const strToSign = `GET\n${TUYA_EMPTY_SHA}\n\n${path}`;
+  const sign = tuyaSign(CFG.TUYA_ID + tuyaAuth.token + t + strToSign);
+  const res = await fetch(tuyaHost() + path, {
+    headers: { client_id: CFG.TUYA_ID, access_token: tuyaAuth.token, sign, t, sign_method: "HMAC-SHA256" },
+    signal: AbortSignal.timeout(15000),
+  });
+  const j = await res.json();
+  if (!j.success) { tuyaAuth.token = null; throw new Error(`Tuya status err ${j.code}: ${j.msg}`); }
+  return j.result; // [{code, value}, ...]
+}
+
+// This TOMZN model packs live V/I/P into an 8-byte base64 blob (phase_a):
+// [voltage ÷10 V][current ÷1000 A, 3B][power W, 3B]. Verified against the device.
+function decodePhase(b64) {
+  try {
+    const b = Buffer.from(b64, "base64");
+    if (b.length < 8) return null;
+    return {
+      voltage: ((b[0] << 8) | b[1]) / 10,
+      current: ((b[2] << 16) | (b[3] << 8) | b[4]) / 1000,
+      power: (b[5] << 16) | (b[6] << 8) | b[7],
+    };
+  } catch { return null; }
+}
+
+// Normalize the TOMZN status array. Prefers the packed phase blob; falls back
+// to flat DPs (cur_power/…) on models that expose them.
+function tuyaParse(status) {
+  const m = {};
+  for (const it of status) m[it.code] = it.value;
+  if (!tuyaRawLogged) { console.log("Tuya raw codes:", JSON.stringify(m)); tuyaRawLogged = true; }
+  const pick = (keys) => { for (const k of keys) if (m[k] !== undefined && m[k] !== null) return Number(m[k]); return null; };
+  const ph = typeof m.phase_a === "string" && m.phase_a ? decodePhase(m.phase_a) : null;
+  let v = ph ? ph.voltage : pick(["cur_voltage", "voltage"]);
+  let a = ph ? ph.current : pick(["cur_current", "current"]);
+  let w = ph ? ph.power : pick(["cur_power", "power", "active_power"]);
+  if (!ph) { // scale flat DPs when the blob isn't present
+    if (v !== null && v > 1000) v /= 10;
+    if (a !== null && a > 100) a /= 1000;
+    if (w !== null && w > 20000) w /= 10;
+  }
+  const e = pick(["total_forward_energy", "add_ele", "forward_energy_total", "total_energy", "energy_forward"]);
+  return {
+    raw: m, voltage: v, current: a, power: w,
+    kwh: e !== null ? e / CFG.TUYA_KWH_SCALE : null,        // ÷100 → kWh (verified)
+    freq: m.supply_frequency != null ? Number(m.supply_frequency) / 10 : null,
+    leakage: m.leakage_current != null ? Number(m.leakage_current) : null,  // mA (LW model)
+    fault: m.fault ?? null,
+    on: m.switch ?? m.switch_1 ?? null,
+  };
 }
 
 // ---------- FETCH INVERTER ----------
@@ -360,13 +453,16 @@ function computeMeters() {
   const active = db.activeLog.length ? db.activeLog[db.activeLog.length - 1].meter : null;
   const cycleDays = loadJson(CFG.DAYS_FILE, []).filter(r => r.date >= cycle.startDate);
   const today = loadJson(CFG.STATE_FILE, null);
-  // auto-estimated grid units attributed to this meter, this cycle
-  const estFor = (id) => +((cycleDays.reduce((s, r) => s + ((r.meterGridWh || {})[id] || 0), 0) +
-    (((today || {}).meterGridWh || {})[id] || 0)) / 1000).toFixed(1);
+  // grid units attributed to this meter, this cycle — measured (TOMZN) preferred,
+  // estimated (inverter-derived) as fallback
+  const sumFor = (id, key) => +((cycleDays.reduce((s, r) => s + ((r[key] || {})[id] || 0), 0) +
+    (((today || {})[key] || {})[id] || 0)) / 1000).toFixed(1);
   const meters = db.meters.map(m => {
     const rs = db.readings.filter(r => r.meter === m.id).sort((a, b) => a.ts - b.ts);
+    const meas = sumFor(m.id, "meterMeasWh"), est = sumFor(m.id, "meterGridWh");
     const base = { id: m.id, name: m.name, protected: m.protected, budget: m.budget,
-      active: m.id === active, est: estFor(m.id), prot: protectionEta(m) };
+      active: m.id === active, est, meas, used_auto: meas > 0 ? meas : est,
+      measured: meas > 0, prot: protectionEta(m) };
     if (!rs.length) return { ...base, noData: true };
     const last = rs[rs.length - 1];
     const prev = rs[rs.length - 2];
@@ -553,16 +649,20 @@ async function poll() {
         date: state.date, pvWh: Math.round(state.pvWh), expPvWh: Math.round(state.expPvWh),
         loadWh: Math.round(state.loadWh), dischargeWh: Math.round(state.dischargeWh),
         chargeWh: Math.round(state.chargeWh), curtWh: Math.round(state.curtWh || 0),
-        gridWh: Math.round(state.gridWh || 0),
+        gridWh: Math.round(state.gridWh || 0), gridMeasWh: Math.round(state.gridMeasWh || 0),
         meterGridWh: Object.fromEntries(Object.entries(state.meterGridWh || {})
+          .map(([k, v]) => [k, Math.round(v)])),
+        meterMeasWh: Object.fromEntries(Object.entries(state.meterMeasWh || {})
           .map(([k, v]) => [k, Math.round(v)])),
         socMin: state.socMin, socMax: state.socMax,
       });
       saveJson(CFG.DAYS_FILE, days);
     }
     const carryOutage = state.gridOutStart || null; // outage spanning midnight
+    const carryTuyaKwh = state.tuyaKwhLast ?? null;  // cumulative meter reading spans days
     state = freshDay(date);
     state.gridOutStart = carryOutage;
+    state.tuyaKwhLast = carryTuyaKwh;
   }
   const profile = loadJson(CFG.PROFILE_FILE, freshProfile());
 
@@ -648,7 +748,28 @@ async function poll() {
     state.gridOutStart = null;
   }
 
-  console.log(`[${new Date().toISOString()}] PV ${Math.round(s.pv_w)}W/${Math.round(expW)}W exp | SOC ${s.soc}% | dis ${s.discharge_a}A | load ${s.load_w}W | ${s.mode}`);
+  // TOMZN breaker (real measurement) — closes the inverter's grid-direct blind spot
+  try {
+    const st = await tuyaStatus();
+    if (st) {
+      const tp = tuyaParse(st);
+      latest.tuya = { ...tp, ts: Date.now() }; latest.tuyaErr = null;
+      // Cumulative kWh delta → today's measured grid + the active meter.
+      // Only when role=grid (breaker reads WAPDA import, not total consumption).
+      if (CFG.TUYA_ROLE === "grid" && tp.kwh !== null) {
+        if (state.tuyaKwhLast != null && tp.kwh >= state.tuyaKwhLast && tp.kwh - state.tuyaKwhLast < 5) {
+          const dWh = (tp.kwh - state.tuyaKwhLast) * 1000;
+          state.gridMeasWh = (state.gridMeasWh || 0) + dWh;
+          const am = activeMeterId();
+          if (am) { state.meterMeasWh = state.meterMeasWh || {}; state.meterMeasWh[am] = (state.meterMeasWh[am] || 0) + dWh; }
+        }
+        state.tuyaKwhLast = tp.kwh;
+      }
+    }
+  } catch (e) { latest.tuyaErr = e.message; console.error("tuya:", e.message); }
+
+  const tW = latest.tuya ? Math.round(latest.tuya.power ?? NaN) : null;
+  console.log(`[${new Date().toISOString()}] PV ${Math.round(s.pv_w)}W/${Math.round(expW)}W exp | SOC ${s.soc}% | dis ${s.discharge_a}A | load ${s.load_w}W${tW != null ? ` | grid-meter ${tW}W` : ""} | ${s.mode}`);
 
   for (const a of runRules(s, state, hour, expW)) await sendAlert(a);
 
@@ -724,6 +845,7 @@ async function statusPayload() {
     usableWh: s ? Math.round(Math.max(0, (s.soc - CFG.RESERVE_SOC) / 100) * CFG.BATT_WH * 0.92) : 0,
     gridW: s ? Math.round(Math.max(0, s.load_w - s.pv_w - dischargeW + chargeW)) : 0,
     battW: Math.round(chargeW - dischargeW),
+    tuya: latest.tuya || null, tuyaErr: latest.tuyaErr || null, tuyaRole: CFG.TUYA_ROLE,
     today: loadJson(CFG.STATE_FILE, null),
     history: history.filter(p => p.t > Date.now() - 12 * 3600_000),
     days: loadJson(CFG.DAYS_FILE, []).slice(-30),
@@ -949,7 +1071,8 @@ tr:last-child td{border-bottom:none}
 <section><h2>Power Flow</h2><div class="card">
   <div class="frow" id="f_solar"><span>☀️ Solar</span><span class="val" id="f_solar_v">—</span></div>
   <div class="frow" id="f_batt"><span>🔋 Battery</span><span class="val" id="f_batt_v">—</span></div>
-  <div class="frow" id="f_grid"><span>⚡ Grid</span><span class="val" id="f_grid_v">—</span></div>
+  <div class="frow" id="f_grid"><span>⚡ Grid (inverter est)</span><span class="val" id="f_grid_v">—</span></div>
+  <div class="frow" id="f_meter" style="display:none"><span>📟 Grid Meter (TOMZN)</span><span class="val" id="f_meter_v">—</span></div>
 </div></section>
 
 <section><h2>Last 12 Hours</h2><div class="card">
@@ -1032,7 +1155,9 @@ function renderMeters(info){
     (info.active ? '' : ' · tap SET ACTIVE on the meter your changeover is on');
   el('meters').innerHTML = info.meters.map(function(m){
     var col = m.status === 'red' ? 'var(--bad)' : m.status === 'amber' ? 'var(--warn)' : 'var(--ok)';
-    var auto = m.est > 0 ? '<div class="sub">auto grid est this cycle: ~' + m.est + ' u' +
+    var autoU = m.measured ? m.meas : m.est;
+    var auto = autoU > 0 ? '<div class="sub">' +
+      (m.measured ? '📟 measured grid this cycle: ' : 'auto grid est this cycle: ~') + autoU + ' u' +
       (m.perDay !== null && m.perDay !== undefined ? ' · ~' + m.perDay + ' u/day from readings' : '') + '</div>' : '';
     var prot = '';
     if (m.prot){
@@ -1224,6 +1349,15 @@ async function load(){
   setFlow('f_grid',
     s.grid_v <= 150 ? 'bad' : d.gridW > 50 ? 'warn' : 'off',
     s.grid_v <= 150 ? 'DOWN — on battery' : d.gridW > 50 ? 'importing ' + fmtW(d.gridW) : 'standby ~0 W');
+  if (d.tuya && d.tuya.power !== null && d.tuya.power !== undefined){
+    el('f_meter').style.display = '';
+    setFlow('f_meter', d.tuya.power > 50 ? 'warn' : 'off',
+      fmtW(d.tuya.power) + (d.tuya.voltage ? ' · ' + Math.round(d.tuya.voltage) + 'V' : '') +
+      (d.today && d.today.gridMeasWh ? ' · ' + (d.today.gridMeasWh/1000).toFixed(1) + 'u today' : ''));
+  } else if (d.tuyaErr){
+    el('f_meter').style.display = '';
+    setFlow('f_meter', 'bad', 'not reading — ' + d.tuyaErr);
+  }
 
   drawChart(d.history);
 
