@@ -73,6 +73,7 @@ const CFG = {
   // Dashboard password (empty = open; REQUIRED before any public deploy)
   DASH_PASSWORD: process.env.DASH_PASSWORD || "",
   HTTP_PORT: num(process.env.HTTP_PORT, 8080), // 0 disables the dashboard
+  PUBLIC_URL: (process.env.PUBLIC_URL || "https://solar.skillmatch.tech").replace(/\/+$/, ""),
 };
 
 function required(k) { const v = process.env[k]; if (!v) { console.error(`Missing env: ${k}`); process.exit(1); } return v; }
@@ -282,6 +283,7 @@ async function sendAlert(text) {
   console.log(`[ALERT] ${text.replace(/\n/g, " | ")}`);
   alertLog.unshift({ ts: Date.now(), text });
   if (alertLog.length > 100) alertLog.pop();
+  if (CFG.PUBLIC_URL) text += `\n\n📊 ${CFG.PUBLIC_URL}`; // link on outbound alerts only
   const jobs = [];
   if (CFG.WAHA_URL && CFG.WAHA_CHAT_ID) {
     jobs.push(fetch(`${CFG.WAHA_URL}/api/sendText`, {
@@ -1386,7 +1388,10 @@ if (CFG.HTTP_PORT > 0) {
     if (req.url.startsWith("/manifest.json")) {
       res.setHeader("Content-Type", "application/manifest+json");
       return res.end(JSON.stringify({
-        name: "Solar Watchdog", short_name: "Solar", start_url: "/", display: "standalone",
+        name: "Solar Watchdog", short_name: "Solar",
+        start_url: CFG.PUBLIC_URL ? CFG.PUBLIC_URL + "/" : "/",
+        scope: CFG.PUBLIC_URL ? CFG.PUBLIC_URL + "/" : "/",
+        display: "standalone",
         background_color: "#0b0f14", theme_color: "#0b0f14",
         icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" }],
       }));
@@ -1411,7 +1416,8 @@ if (CFG.HTTP_PORT > 0) {
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.end(DASHBOARD_HTML);
     }
-  }).listen(CFG.HTTP_PORT, () => console.log(`Dashboard: http://localhost:${CFG.HTTP_PORT}`));
+  }).listen(CFG.HTTP_PORT, () => console.log(
+    `Dashboard: http://localhost:${CFG.HTTP_PORT}${CFG.PUBLIC_URL ? " → " + CFG.PUBLIC_URL : ""}`));
 }
 
 console.log(`Solar Watchdog v2 — every ${CFG.POLL_MINUTES} min | site ${CFG.LAT},${CFG.LON} | array ${CFG.KWP_W}W`);

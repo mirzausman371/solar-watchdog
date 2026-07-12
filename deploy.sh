@@ -38,7 +38,7 @@ echo "==> Starting under pm2…"
 ssh "$TARGET" "
   cd $REMOTE_DIR
   pm2 delete solar-watchdog 2>/dev/null || true
-  pm2 start index.mjs --name solar-watchdog --node-args='--env-file=$REMOTE_DIR/.env' --time
+  pm2 start index.mjs --name solar-watchdog --node-args=\"--env-file=\$PWD/.env\" --time
   pm2 save
   pm2 startup -u \$(whoami) --hp \$HOME 2>/dev/null | tail -1 || true
   sleep 3
