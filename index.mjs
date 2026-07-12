@@ -257,6 +257,27 @@ function decodePhase(b64) {
   } catch { return null; }
 }
 
+// Decode the alarm_set_1/2 raw blobs → protection thresholds. Each 4-byte group
+// is [type, enable, value_hi, value_lo]; type IDs vary by firmware so we label by
+// value range (matches TOMPD defaults: leakage 30mA, OC ~50A, UV 170V, OV 250V).
+function decodeAlarms(...b64s) {
+  const out = [];
+  for (const b64 of b64s) {
+    if (typeof b64 !== "string" || !b64) continue;
+    let buf; try { buf = Buffer.from(b64, "base64"); } catch { continue; }
+    for (let i = 0; i + 4 <= buf.length; i += 4) {
+      const type = buf[i], on = !!buf[i + 1], val = (buf[i + 2] << 8) | buf[i + 3];
+      let label = "Protection " + type, unit = "";
+      if (val <= 35) { label = "Leakage trip"; unit = "mA"; }
+      else if (val <= 120) { label = "Over-current"; unit = "A"; }
+      else if (val <= 215) { label = "Under-voltage"; unit = "V"; }
+      else { label = "Over-voltage"; unit = "V"; }
+      out.push({ type, on, value: val, label, unit });
+    }
+  }
+  return out;
+}
+
 // Normalize the TOMZN status array. Prefers the packed phase blob; falls back
 // to flat DPs (cur_power/…) on models that expose them.
 function tuyaParse(status) {
@@ -276,11 +297,17 @@ function tuyaParse(status) {
   const e = pick(["total_forward_energy", "add_ele", "forward_energy_total", "total_energy", "energy_forward"]);
   return {
     raw: m, voltage: v, current: a, power: w,
+    pf: v && a && w ? Math.min(1, +(w / (v * a)).toFixed(2)) : null,
     kwh: e !== null ? e / CFG.TUYA_KWH_SCALE : null,        // ÷100 → kWh (verified)
     freq: m.supply_frequency != null ? Number(m.supply_frequency) / 10 : null,
     leakage: m.leakage_current != null ? Number(m.leakage_current) : null,  // mA (LW model)
-    fault: m.fault ?? null,
+    fault: m.fault ?? 0,
     on: m.switch ?? m.switch_1 ?? null,
+    prepay: m.switch_prepayment ?? null,
+    balance: m.balance_energy != null ? Number(m.balance_energy) / 10 : null,  // units left before auto-cutoff
+    charged: m.charge_energy != null ? Number(m.charge_energy) : null,          // last top-up (kWh)
+    breakerNo: m.breaker_number ?? null,
+    protections: decodeAlarms(m.alarm_set_1, m.alarm_set_2),
   };
 }
 
@@ -765,6 +792,13 @@ async function poll() {
         }
         state.tuyaKwhLast = tp.kwh;
       }
+      // Breaker safety alerts
+      if (tp.prepay && tp.balance != null && tp.balance < 15 && shouldFire(state, "prepay_low"))
+        await sendAlert(`🟠 BREAKER BALANCE LOW: ${tp.balance.toFixed(1)} units left\nMain breaker auto-cuts the house at 0. Top up (charge_energy) or rotate the changeover.`);
+      if (tp.on === false && shouldFire(state, "breaker_off"))
+        await sendAlert(`🔴 MAIN BREAKER OFF\nTOMZN reports the house supply is disconnected${tp.prepay && tp.balance != null && tp.balance <= 0 ? " — prepay balance hit 0" : ""}.`);
+      if (tp.fault && shouldFire(state, "breaker_fault"))
+        await sendAlert(`🔴 BREAKER FAULT (code ${tp.fault})\nCheck the TOMZN — over/under-voltage, over-current, or leakage trip.`);
     }
   } catch (e) { latest.tuyaErr = e.message; console.error("tuya:", e.message); }
 
@@ -1075,6 +1109,10 @@ tr:last-child td{border-bottom:none}
   <div class="frow" id="f_meter" style="display:none"><span>📟 Grid Meter (TOMZN)</span><span class="val" id="f_meter_v">—</span></div>
 </div></section>
 
+<section><h2>Today's Energy Sources</h2><div class="card">
+  <div id="mix"><div class="empty">Gathering today's energy…</div></div>
+</div></section>
+
 <section><h2>Last 12 Hours</h2><div class="card">
   <div class="legend">
     <span><i style="background:#38bdf8"></i>Solar</span>
@@ -1099,6 +1137,17 @@ tr:last-child td{border-bottom:none}
     <div class="row"><span>7-day performance</span><b id="sy_pr">collecting…</b></div>
   </div></div></div>
 </div>
+
+<section id="brk_section" style="display:none"><h2>Main Breaker — TOMZN (all settings)</h2>
+<div class="g2">
+  <div class="card"><div class="k">Prepay Cutoff Balance</div>
+    <div class="v" id="brk_bal">—</div>
+    <div class="sub" id="brk_bal_sub">units remaining before auto-disconnect</div>
+    <div class="bar"><i id="brk_bal_bar" style="width:0%"></i></div></div>
+  <div class="card"><div class="k">Live</div><div class="rows" id="brk_live" style="margin-top:8px"></div></div>
+</div>
+<div class="card" style="margin-top:12px"><div class="k">Configuration &amp; Protection</div>
+  <div class="rows" id="brk_cfg" style="margin-top:10px"></div></div></section>
 
 <section><h2>FESCO Meters <span id="mcycle" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
 <div class="grid" id="meters"><div class="empty">Loading…</div></div></section>
@@ -1238,21 +1287,30 @@ async function setActive(id){
 
 function drawMonth(days){
   if (!days || !days.length) return;
-  var W = 820, H = 200, B = 18, T = 8;
-  var n = days.length, slot = (W - 20) / n, bw = Math.max(6, Math.floor(slot) - 4);
+  var W = 820, H = 220, L = 34, R = 10, B = 22, T = 16;
+  var n = days.length, slot = (W-L-R) / n, bw = Math.max(6, Math.floor(slot) - 4);
   var max = 1;
   days.forEach(function(d){ max = Math.max(max, d.pvWh, d.expPvWh || 0, d.loadWh); });
-  var svg = '';
+  max = max / 1000 * 1.15;
+  function Y(kwh){ return H-B - (H-B-T) * (kwh/max); }
+  var grid = '', yl = '';
+  for (var g = 0; g <= 3; g++){
+    var yv = max * g / 3, y = Y(yv);
+    grid += '<line x1="' + L + '" y1="' + y.toFixed(1) + '" x2="' + (W-R) + '" y2="' + y.toFixed(1) + '" stroke="#1e2936" stroke-width="1"/>';
+    yl += '<text x="' + (L-6) + '" y="' + (y+3).toFixed(1) + '" fill="#8fa1b3" font-size="10" text-anchor="end">' + yv.toFixed(0) + '</text>';
+  }
+  var svg = '', step = Math.max(1, Math.ceil(n/8));
   days.forEach(function(d, i){
-    var x = 10 + i * slot;
-    var h = (H-B-T) * d.pvWh / max, he = (H-B-T) * (d.expPvWh || 0) / max, hl = (H-B-T) * d.loadWh / max;
-    svg += '<rect x="' + x.toFixed(1) + '" y="' + (H-B-h).toFixed(1) + '" width="' + bw + '" height="' + Math.max(1, h).toFixed(1) + '" rx="2" fill="#38bdf8" opacity=".85"/>';
-    svg += '<rect x="' + x.toFixed(1) + '" y="' + (H-B-he).toFixed(1) + '" width="' + bw + '" height="1.5" fill="#8fa1b3"/>';
-    svg += '<rect x="' + x.toFixed(1) + '" y="' + (H-B-hl).toFixed(1) + '" width="' + bw + '" height="1.5" fill="#fbbf24"/>';
-    if (i === 0 || i === n-1 || i % 7 === 0)
-      svg += '<text x="' + (x + bw/2).toFixed(1) + '" y="' + (H-4) + '" fill="#8fa1b3" font-size="9" text-anchor="middle">' + d.date.slice(5) + '</text>';
+    var x = L + i * slot + 2, gen = d.pvWh/1000;
+    svg += '<rect x="' + x.toFixed(1) + '" y="' + Y(gen).toFixed(1) + '" width="' + bw + '" height="' + Math.max(1, (H-B)-Y(gen)).toFixed(1) + '" rx="2" fill="#38bdf8" opacity=".9"/>';
+    svg += '<rect x="' + x.toFixed(1) + '" y="' + Y((d.expPvWh||0)/1000).toFixed(1) + '" width="' + bw + '" height="1.5" fill="#8fa1b3"/>';
+    svg += '<rect x="' + x.toFixed(1) + '" y="' + Y(d.loadWh/1000).toFixed(1) + '" width="' + bw + '" height="1.5" fill="#fbbf24"/>';
+    if (n <= 16) svg += '<text x="' + (x + bw/2).toFixed(1) + '" y="' + (Y(gen)-3).toFixed(1) + '" fill="#e7eef6" font-size="8.5" text-anchor="middle">' + gen.toFixed(0) + '</text>';
+    if (i === 0 || i === n-1 || i % step === 0)
+      svg += '<text x="' + (x + bw/2).toFixed(1) + '" y="' + (H-6) + '" fill="#8fa1b3" font-size="9" text-anchor="middle">' + d.date.slice(5) + '</text>';
   });
-  el('month').innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto">' + svg + '</svg>';
+  el('month').innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto">' +
+    grid + yl + '<text x="4" y="11" fill="#8fa1b3" font-size="10">kWh</text>' + svg + '</svg>';
 }
 
 async function logMeter(id){
@@ -1266,39 +1324,73 @@ async function logMeter(id){
   if (j.error) { alert(j.error); } else { load(); }
 }
 
+function fmtKw(w){ return w >= 1000 ? (w/1000).toFixed(1) + 'k' : String(Math.round(w)); }
 function drawChart(hist){
   if (!hist || hist.length < 2){
     el('chart').innerHTML = '<div class="empty">Collecting data… (chart appears after a few datalogger uploads)</div>';
     return;
   }
-  var W = 820, H = 230, L = 8, R = 8, B = 20, T = 8;
+  var W = 820, H = 250, L = 44, R = 12, B = 24, T = 12;
   var t0 = hist[0].t, t1 = hist[hist.length-1].t;
   var ymax = 600;
   hist.forEach(function(p){ ymax = Math.max(ymax, p.pv, p.exp, p.load); });
-  ymax *= 1.08;
+  ymax *= 1.1;
   function X(t){ return L + (W-L-R) * (t-t0) / Math.max(1, t1-t0); }
   function Y(v){ return H-B - (H-B-T) * (v/ymax); }
   function Ys(soc){ return H-B - (H-B-T) * (soc/100); }
   function path(key){ return hist.map(function(p,i){
     return (i ? 'L' : 'M') + X(p.t).toFixed(1) + ' ' + Y(p[key]).toFixed(1); }).join(' '); }
+  // y-axis: left = Watts, right = SOC %
+  var grid = '', yl = '';
+  for (var g = 0; g <= 4; g++){
+    var yv = ymax * g / 4, y = Y(yv);
+    grid += '<line x1="' + L + '" y1="' + y.toFixed(1) + '" x2="' + (W-R) + '" y2="' + y.toFixed(1) + '" stroke="#1e2936" stroke-width="1"/>';
+    yl += '<text x="' + (L-6) + '" y="' + (y+3).toFixed(1) + '" fill="#8fa1b3" font-size="10" text-anchor="end">' + fmtKw(yv) + '</text>';
+    yl += '<text x="' + (W-R+4) + '" y="' + (y+3).toFixed(1) + '" fill="#34d399" font-size="10" text-anchor="start">' + Math.round(100*g/4) + '</text>';
+  }
   var area = path('pv') + ' L' + X(t1).toFixed(1) + ' ' + (H-B) + ' L' + X(t0).toFixed(1) + ' ' + (H-B) + ' Z';
   var socPath = hist.map(function(p,i){
     return (i ? 'L' : 'M') + X(p.t).toFixed(1) + ' ' + Ys(p.soc).toFixed(1); }).join(' ');
-  var labels = '';
+  var xl = '';
   for (var k = 0; k <= 4; k++){
     var tt = t0 + (t1-t0) * k / 4;
     var anchor = k === 0 ? 'start' : k === 4 ? 'end' : 'middle';
-    labels += '<text x="' + X(tt).toFixed(0) + '" y="' + (H-5) + '" fill="#8fa1b3" font-size="10" text-anchor="' + anchor + '">' +
+    xl += '<text x="' + X(tt).toFixed(0) + '" y="' + (H-7) + '" fill="#8fa1b3" font-size="10" text-anchor="' + anchor + '">' +
       new Date(tt).toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'}) + '</text>';
   }
   el('chart').innerHTML =
-    '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto;display:block">' +
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto;display:block">' + grid +
+    '<text x="' + (L-6) + '" y="9" fill="#8fa1b3" font-size="9" text-anchor="end">W</text>' +
+    '<text x="' + (W-R+4) + '" y="9" fill="#34d399" font-size="9" text-anchor="start">%</text>' +
     '<path d="' + area + '" fill="rgba(56,189,248,.12)"/>' +
     '<path d="' + path('pv') + '" stroke="#38bdf8" fill="none" stroke-width="2" stroke-linejoin="round"/>' +
     '<path d="' + path('exp') + '" stroke="#8fa1b3" fill="none" stroke-width="1.5" stroke-dasharray="5 4"/>' +
     '<path d="' + path('load') + '" stroke="#fbbf24" fill="none" stroke-width="1.5"/>' +
     '<path d="' + socPath + '" stroke="#34d399" fill="none" stroke-width="1.5" opacity=".85"/>' +
-    labels + '</svg>';
+    yl + xl + '</svg>';
+}
+
+// Pie of today's energy sources — each slice direct-labeled (name · kWh · %)
+function drawPie(parts){
+  var total = parts.reduce(function(s,p){ return s + Math.max(0,p.val); }, 0);
+  if (total <= 0.05){ el('mix').innerHTML = '<div class="empty">No energy recorded yet today.</div>'; return; }
+  var cx = 90, cy = 90, r = 78, ang = -Math.PI/2, svg = '';
+  parts.forEach(function(p){
+    if (p.val <= 0) return;
+    var frac = p.val/total, a2 = ang + frac*2*Math.PI;
+    if (frac >= 0.999){ svg += '<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="'+p.color+'"/>'; ang = a2; return; }
+    var x1 = cx+r*Math.cos(ang), y1 = cy+r*Math.sin(ang), x2 = cx+r*Math.cos(a2), y2 = cy+r*Math.sin(a2);
+    svg += '<path d="M'+cx+' '+cy+' L'+x1.toFixed(1)+' '+y1.toFixed(1)+' A'+r+' '+r+' 0 '+(frac>0.5?1:0)+' 1 '+x2.toFixed(1)+' '+y2.toFixed(1)+' Z" fill="'+p.color+'" stroke="var(--card)" stroke-width="2"/>';
+    ang = a2;
+  });
+  var legend = parts.filter(function(p){ return p.val > 0; }).map(function(p){
+    return '<div class="row"><span><i class="st" style="background:'+p.color+'"></i>'+p.label+'</span>' +
+      '<b>'+p.val.toFixed(1)+' kWh · '+Math.round(100*p.val/total)+'%</b></div>';
+  }).join('');
+  el('mix').innerHTML = '<div style="display:flex;gap:22px;align-items:center;flex-wrap:wrap">' +
+    '<svg viewBox="0 0 180 180" style="width:170px;height:170px;flex:none">'+svg+'</svg>' +
+    '<div class="rows" style="flex:1;min-width:210px">'+legend+
+    '<div class="sub" style="margin-top:6px">battery figure is stored solar released later</div></div></div>';
 }
 
 async function load(){
@@ -1400,6 +1492,49 @@ async function load(){
       d.netMetering.rsYear.toLocaleString() + '/yr at Rs ' + d.cfg.nmExportRs + '/unit export';
   }
   drawMonth(d.days);
+
+  if (d.today){
+    drawPie([
+      { label: '☀️ Solar generated', val: d.today.pvWh/1000, color: '#38bdf8' },
+      { label: '🔋 Battery discharged', val: d.today.dischargeWh/1000, color: '#34d399' },
+      { label: '⚡ Grid imported', val: (d.today.gridMeasWh || d.today.gridWh || 0)/1000, color: '#fbbf24' },
+    ]);
+  }
+
+  if (d.tuya){
+    el('brk_section').style.display = '';
+    var tk = d.tuya, CUT = 180;
+    if (tk.prepay && tk.balance !== null){
+      el('brk_bal').textContent = tk.balance.toFixed(1) + ' u';
+      el('brk_bal_bar').style.width = Math.min(100, 100*tk.balance/CUT) + '%';
+      el('brk_bal_bar').style.background = tk.balance < 15 ? 'var(--bad)' : tk.balance < 40 ? 'var(--warn)' : 'var(--ok)';
+      el('brk_bal_sub').textContent = 'units until auto-disconnect · prepay ON';
+    } else {
+      el('brk_bal').textContent = 'OFF';
+      el('brk_bal_sub').textContent = 'prepayment off — no auto cutoff';
+    }
+    el('brk_live').innerHTML = [
+      ['Supply', '<b style="color:' + (tk.on === false ? 'var(--bad)' : 'var(--ok)') + '">' + (tk.on === false ? 'OFF' : 'ON') + '</b>'],
+      ['Voltage', tk.voltage !== null ? tk.voltage.toFixed(1) + ' V' : '—'],
+      ['Current', tk.current !== null ? tk.current.toFixed(2) + ' A' : '—'],
+      ['Power', tk.power !== null ? fmtW(tk.power) : '—'],
+      ['Power factor', tk.pf !== null ? tk.pf : '—'],
+      ['Frequency', tk.freq !== null ? tk.freq.toFixed(1) + ' Hz' : '—'],
+      ['Leakage current', tk.leakage !== null ? tk.leakage + ' mA' : '—'],
+      ['Total through breaker', tk.kwh !== null ? tk.kwh.toFixed(2) + ' kWh' : '—'],
+    ].map(function(r){ return '<div class="row"><span>' + r[0] + '</span><b>' + r[1] + '</b></div>'; }).join('');
+    var cfg = [
+      ['Prepayment mode', tk.prepay ? 'ON (auto-cutoff)' : 'off'],
+      ['Balance remaining', tk.balance !== null ? tk.balance.toFixed(1) + ' units' : '—'],
+      ['Last top-up', tk.charged !== null ? tk.charged + ' kWh' : '—'],
+      ['Fault', tk.fault ? 'code ' + tk.fault : 'none ✓'],
+      ['Breaker no.', tk.breakerNo || '—'],
+    ];
+    (tk.protections || []).forEach(function(p){ cfg.push([p.label + (p.on ? '' : ' (off)'), p.value + ' ' + p.unit]); });
+    el('brk_cfg').innerHTML = cfg.map(function(r){ return '<div class="row"><span>' + r[0] + '</span><b>' + r[1] + '</b></div>'; }).join('') +
+      '<div class="sub" style="margin-top:6px">protection thresholds decoded from the breaker — confirm against the Smart Life app</div>';
+  }
+
   window.__tariff = d.cfg.tariff;
   if (!window.__repInit){ window.__repInit = 1; loadReport(); }
 
