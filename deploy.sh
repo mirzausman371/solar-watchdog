@@ -45,9 +45,7 @@ ssh "$TARGET" "
   pm2 logs solar-watchdog --lines 6 --nostream
 "
 
-echo "==> Opening port 8080 (if ufw is active)…"
-ssh "$TARGET" 'sudo ufw status 2>/dev/null | grep -q "Status: active" && sudo ufw allow 8080/tcp || echo "ufw inactive or unavailable — skipping"'
-
+# Port 8080 stays firewalled — access is via the nginx HTTPS proxy only.
 SERVER_IP="${TARGET##*@}"
 echo ""
-echo "✅ Deployed. Dashboard: http://$SERVER_IP:8080 (login with your DASH_PASSWORD)"
+echo "✅ Deployed. Watchdog on 127.0.0.1:8080 behind nginx (see PUBLIC_URL)."

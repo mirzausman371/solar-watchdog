@@ -234,7 +234,23 @@ Owner has self-hosted WAHA (used for Zehni Academy) + production Ubuntu servers
   (130u → proj 146/200, 4.9 u/day). Test readings cleared; activeLog kept
   (usman marked active — owner should correct if wrong). readings[] is
   EMPTY awaiting real data: owner will backfill bill readings + log today.
-- **2026-07-03 (DEPLOYED TO PRODUCTION):** Live at https://solar.skillmatch.tech
+- **2026-07-12 (SERVER MIGRATION):** Owner moved infra to a NEW VPS —
+  srv1816866, root@187.127.204.212 (old srv901606/31.97.109.46 being retired;
+  it banned the Mac IP and still runs a stale watchdog — old pm2 process must
+  be deleted + its /root/solar-watchdog data (Jul 3–12 days.json/history/
+  meters) is worth copying to the new box before decommission). Redeployed
+  to new server: pm2 + nginx + fresh certbot cert (expires ~2026-10-10),
+  ufw already had 80/443; port 8080 NOT exposed (nginx-only — deploy.sh no
+  longer opens it). PUBLIC_URL feature live (alerts carry dashboard link;
+  PWA start_url/scope). Verified E2E Jul 12: 200 + login + live data.
+  Mac ssh key authorized on new server. NOTE: another Claude session lives
+  on the new server (~/projects/solar-watchdog git clone — code only, no
+  runtime data; my deploy target is /root/solar-watchdog). Morning snapshot
+  Jul 12: SOC 16% (!) — battery drained far below 50% reserve overnight;
+  BMS/SOC-reserve installer fix STILL pending. 7-Jul cycle baselines were
+  NOT logged (dashboard was down over the 7th — DNS pointed at new server
+  before it was set up); owner should log all 4 meters now + backdate from
+  July bills when they arrive. DASH_PASSWORD still solar123 — weak. Live at https://solar.skillmatch.tech
   — Hostinger VPS srv901606 (root@31.97.109.46), pm2 process "solar-watchdog",
   /root/solar-watchdog, node-args --env-file=/root/solar-watchdog/.env
   (ABSOLUTE path — ~ breaks in node-args; deploy.sh has this bug, fixed
