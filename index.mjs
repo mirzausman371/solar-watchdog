@@ -1,0 +1,1419 @@
+// ============================================================
+//  SOLAR WATCHDOG v2 — Knox 6.5kW + Powerwall (devcode 6431)
+//  v2 adds:
+//   • Weather-aware expected-output model (Open-Meteo, free/no key)
+//   • Curtailment-aware underperformance alerts
+//   • Self-learning hourly load profile (EMA)
+//   • Evening battery sufficiency forecast
+//   • Performance Ratio in daily digest
+//  Zero dependencies. Node.js >= 18.
+// ============================================================
+
+import { readFileSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
+import { createServer } from "node:http";
+import { join } from "node:path";
+import { createHash, createHmac } from "node:crypto";
+
+const DIR = import.meta.dirname; // state files live next to the script, not cwd
+
+// ---------- CONFIG ----------
+const CFG = {
+  DESS_URL: required("DESS_URL"),
+  POLL_MINUTES: num(process.env.POLL_MINUTES, 10),
+  TZ: process.env.TZ_NAME || "Asia/Karachi",
+
+  // Site & system model
+  LAT: num(process.env.LAT, 31.42),          // Faisalabad default
+  LON: num(process.env.LON, 73.08),
+  KWP_W: num(process.env.KWP_W, 8400),        // array DC watts
+  PV_CAP_W: num(process.env.PV_CAP_W, 6500),  // inverter max PV input
+  SYSTEM_LOSS: num(process.env.SYSTEM_LOSS, 0.86), // wiring+soiling+inverter
+  BATT_WH: num(process.env.BATT_WH, 5120),    // Powerwall real capacity
+  RESERVE_SOC: num(process.env.RESERVE_SOC, 50),
+
+  // Alerts
+  WAHA_URL: process.env.WAHA_URL || "",
+  WAHA_SESSION: process.env.WAHA_SESSION || "default",
+  WAHA_CHAT_ID: process.env.WAHA_CHAT_ID || "",
+  WAHA_API_KEY: process.env.WAHA_API_KEY || "",
+  TELEGRAM_TOKEN: process.env.TELEGRAM_TOKEN || "",
+  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || "",
+
+  // Thresholds
+  PV2_DEAD_VOLTS: num(process.env.PV2_DEAD_VOLTS, 50),
+  PR_ALERT: num(process.env.PR_ALERT, 0.65),  // actual < 65% of expected → alert
+  EVENING_SOC_LOCK: num(process.env.EVENING_SOC_LOCK, 55),
+  DEEP_SOC: num(process.env.DEEP_SOC, 15),
+  STALE_MINUTES: num(process.env.STALE_MINUTES, 30),
+  ALERT_COOLDOWN_MIN: num(process.env.ALERT_COOLDOWN_MIN, 90),
+  DIGEST_HOUR: num(process.env.DIGEST_HOUR, 21),
+  FORECAST_HOUR: num(process.env.FORECAST_HOUR, 18), // evening sufficiency check
+
+  STATE_FILE: process.env.STATE_FILE || join(DIR, "state.json"),
+  PROFILE_FILE: process.env.PROFILE_FILE || join(DIR, "profile.json"),
+  HISTORY_FILE: process.env.HISTORY_FILE || join(DIR, "history.jsonl"), // chart samples, append-only
+  DAYS_FILE: process.env.DAYS_FILE || join(DIR, "days.json"),           // one summary row per day
+  METERS_FILE: process.env.METERS_FILE || join(DIR, "meters.json"),     // FESCO readings + budgets
+  BATT_FILE: process.env.BATT_FILE || join(DIR, "batt.json"),           // battery capacity estimates
+
+  // Money & meters
+  TARIFF_RS: num(process.env.TARIFF_RS, 45),            // blended Rs/unit for savings math
+  SYSTEM_COST_RS: num(process.env.SYSTEM_COST_RS, 0),   // total install cost; 0 hides payback card
+  PAYBACK_BASE_KWH: num(process.env.PAYBACK_BASE_KWH, 0), // units generated before tracking began
+  UTC_OFFSET: process.env.UTC_OFFSET || "+05:00",       // Asia/Karachi is fixed UTC+5 (no DST)
+  NM_EXPORT_RS: num(process.env.NM_EXPORT_RS, 27),      // net-metering export rate Rs/unit
+  OUTAGES_FILE: process.env.OUTAGES_FILE || join(DIR, "outages.json"), // loadshedding log
+  HEARTBEAT_URL: process.env.HEARTBEAT_URL || "",       // dead-man's switch ping (healthchecks.io)
+
+  // DessMonitor login (streamlined auth — tokens auto-refresh forever).
+  // When set, DESS_URL is only used for its device params (pn/sn/devcode/…).
+  DESS_USER: process.env.DESS_USER || "",
+  DESS_PASSWORD: process.env.DESS_PASSWORD || "",
+
+  // Dashboard password (empty = open; REQUIRED before any public deploy)
+  DASH_PASSWORD: process.env.DASH_PASSWORD || "",
+  HTTP_PORT: num(process.env.HTTP_PORT, 8080), // 0 disables the dashboard
+};
+
+function required(k) { const v = process.env[k]; if (!v) { console.error(`Missing env: ${k}`); process.exit(1); } return v; }
+function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
+
+// ---------- FIELD MAP (devcode 6431, verified) ----------
+const FIELDS = {
+  pv1_v: "bt_voltage_1", pv2_v: "bt_voltage_2",
+  pv1_w: "bt_inputpower_1", pv2_w: "bt_inp_power_2",
+  batt_v: "bt_battery_voltage", soc: "bt_battery_capacity",
+  discharge_a: "bt_battery_discharge_current", charge_a: "bt_battery_charging_current",
+  grid_v: "bt_grid_voltage", load_w: "bt_load_active_power_sole",
+};
+const MODE_FIELD = "bc_model";
+
+// ---------- PERSISTENCE ----------
+function loadJson(f, fallback) { if (existsSync(f)) { try { return JSON.parse(readFileSync(f, "utf8")); } catch {} } return fallback; }
+function saveJson(f, o) { writeFileSync(f, JSON.stringify(o, null, 2)); }
+function freshDay(date) {
+  return { date, pvWh: 0, expPvWh: 0, loadWh: 0, dischargeWh: 0, chargeWh: 0, curtWh: 0,
+           gridWh: 0, meterGridWh: {}, socMin: 100, socMax: 0, gridOutStart: null,
+           lastAlerts: {}, digestSent: false, forecastSent: false };
+}
+function freshProfile() { return { hourlyLoadW: Array(24).fill(0), seen: Array(24).fill(0) }; }
+
+// ---------- TIME ----------
+function nowParts() {
+  const fmt = new Intl.DateTimeFormat("en-GB", { timeZone: CFG.TZ, hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit" });
+  const p = Object.fromEntries(fmt.formatToParts(new Date()).map(x => [x.type, x.value]));
+  return { date: `${p.year}-${p.month}-${p.day}`, hour: Number(p.hour) };
+}
+
+// ---------- WEATHER (Open-Meteo, cached 1h) ----------
+let weatherCache = { ts: 0, hours: null };
+async function getWeather() {
+  if (Date.now() - weatherCache.ts < 55 * 60_000 && weatherCache.hours) return weatherCache.hours;
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${CFG.LAT}&longitude=${CFG.LON}` +
+    `&hourly=shortwave_radiation,temperature_2m,cloud_cover&forecast_days=2&timezone=${encodeURIComponent(CFG.TZ)}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+  if (!res.ok) throw new Error(`weather HTTP ${res.status}`);
+  const j = await res.json();
+  const hours = j.hourly.time.map((t, i) => ({
+    date: t.slice(0, 10),
+    hour: Number(t.slice(11, 13)),
+    ghi: j.hourly.shortwave_radiation[i],   // W/m²
+    temp: j.hourly.temperature_2m[i],       // °C
+    cloud: j.hourly.cloud_cover[i],         // %
+  }));
+  weatherCache = { ts: Date.now(), hours };
+  return hours;
+}
+
+// Expected PV watts for a given hour's weather
+function expectedPvW(ghi, ambientC) {
+  if (!ghi || ghi <= 0) return 0;
+  const cellT = ambientC + 30 * (ghi / 1000);          // NOCT approximation
+  const tempDerate = 1 - 0.004 * Math.max(0, cellT - 25); // LiFePO4-era mono coefficient
+  const w = CFG.KWP_W * (ghi / 1000) * tempDerate * CFG.SYSTEM_LOSS;
+  return Math.min(w, CFG.PV_CAP_W);
+}
+
+// Tomorrow's expected generation (kWh) + midday cloud cover, for the digest
+function tomorrowOutlook(wx, todayDate) {
+  const tom = wx.filter(x => x.date > todayDate);
+  if (!tom.length) return null;
+  const kwh = tom.reduce((sum, x) => sum + expectedPvW(x.ghi, x.temp), 0) / 1000;
+  const midday = tom.filter(x => x.hour >= 10 && x.hour <= 15);
+  const cloud = midday.length ? Math.round(midday.reduce((s, x) => s + x.cloud, 0) / midday.length) : 0;
+  return { kwh, cloud };
+}
+
+// ---------- DESSMONITOR AUTH (self-refreshing tokens) ----------
+// Sign scheme (per the public dessmonitor integrations):
+//   login: sha1(salt + sha1(password) + "&action=authSource&usr=…&source=1&company-key=…")
+//   data:  sha1(salt + secret + token + "&action=…&params")
+const DESS_BASE = "https://api.dessmonitor.com/public/";
+const DESS_COMPANY_KEY = "bnrl_frRFjEz8Mkn";
+const DESS_APP = "&_app_client_=web&_app_id_=solar-watchdog&_app_version_=2.0.0";
+const sha1 = (s) => createHash("sha1").update(s).digest("hex");
+
+// Device identity (pn/sn/devcode/devaddr/i18n/source) comes from the copied URL
+function deviceParams() {
+  const u = new URL(CFG.DESS_URL);
+  const keep = ["i18n", "lang", "source", "devcode", "pn", "devaddr", "sn"];
+  const out = [];
+  for (const [k, v] of u.searchParams) if (keep.includes(k)) out.push(`${k}=${encodeURIComponent(v)}`);
+  return out.join("&");
+}
+
+let dessAuth = { token: null, secret: null, expireAt: 0 };
+
+async function dessLogin() {
+  const salt = Date.now().toString();
+  const action = `&action=authSource&usr=${encodeURIComponent(CFG.DESS_USER)}&company-key=${DESS_COMPANY_KEY}&source=1${DESS_APP}`;
+  const sign = sha1(salt + sha1(CFG.DESS_PASSWORD) + action);
+  const res = await fetch(`${DESS_BASE}?sign=${sign}&salt=${salt}${action}`, { signal: AbortSignal.timeout(20000) });
+  if (!res.ok) throw new Error(`login HTTP ${res.status}`);
+  const j = await res.json();
+  if (j.err !== 0) throw new Error(`DessMonitor login failed (err ${j.err}: ${j.desc})`);
+  // refresh 1h before the server-declared expiry (typically ~7 days)
+  dessAuth = {
+    token: j.dat.token, secret: j.dat.secret,
+    expireAt: Date.now() + (Number(j.dat.expire) || 7 * 86400) * 1000 - 3600_000,
+  };
+  console.log(`DessMonitor: authenticated as ${CFG.DESS_USER}, token valid ~${Math.max(1, Math.round((dessAuth.expireAt - Date.now()) / 86400e3))}d`);
+}
+
+async function dessDataUrl() {
+  if (!CFG.DESS_USER || !CFG.DESS_PASSWORD) return CFG.DESS_URL; // fallback: static copied URL
+  if (!dessAuth.token || Date.now() > dessAuth.expireAt) await dessLogin();
+  const salt = Date.now().toString();
+  const action = `&action=querySPDeviceLastData&${deviceParams()}${DESS_APP}`;
+  const sign = sha1(salt + dessAuth.secret + dessAuth.token + action);
+  return `${DESS_BASE}?sign=${sign}&salt=${salt}&token=${dessAuth.token}${action}`;
+}
+
+// ---------- FETCH INVERTER ----------
+async function fetchSnapshot() {
+  const res = await fetch(await dessDataUrl(), { signal: AbortSignal.timeout(20000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const j = await res.json();
+  if (j.err !== 0) {
+    dessAuth.token = null; // token may have been revoked — re-login on next attempt
+    throw new Error(`API err ${j.err}: ${j.desc}`);
+  }
+  const flat = {};
+  for (const g of Object.values(j.dat.pars)) for (const item of g) flat[item.id] = item.val;
+  const v = (k) => Number(flat[FIELDS[k]] ?? NaN);
+  const out = {
+    gts: Number(j.dat.gts),
+    pv1_v: v("pv1_v"), pv2_v: v("pv2_v"), pv1_w: v("pv1_w") || 0, pv2_w: v("pv2_w") || 0,
+    pv_w: (v("pv1_w") || 0) + (v("pv2_w") || 0),
+    batt_v: v("batt_v"), soc: v("soc"),
+    discharge_a: v("discharge_a"), charge_a: v("charge_a"),
+    grid_v: v("grid_v"), load_w: v("load_w"),
+    mode: flat[MODE_FIELD] || "unknown",
+  };
+  trackFreshness(out.gts);
+  return out;
+}
+
+// ---------- DATA FRESHNESS ----------
+// DessMonitor's gts is offset from wall clock (Eybond servers ≠ PKT), so
+// absolute age is meaningless. Fresh = gts ADVANCED since the last fetch.
+let lastSeenGts = 0;
+let lastNewDataAt = Date.now(); // boot counts as fresh; alarms 30 min later if gts never moves
+function trackFreshness(gts) {
+  if (gts !== lastSeenGts) { lastSeenGts = gts; lastNewDataAt = Date.now(); }
+}
+
+// ---------- LIVE STATUS (feeds the dashboard) ----------
+const latest = { snapshot: null, expW: 0, fetchedAt: 0, error: null };
+const alertLog = []; // in-memory, newest first, capped
+
+// Rolling sample history for the live chart. Deduped by gts, so it only grows
+// when the datalogger actually uploads a new reading (~5 min cadence).
+const history = [];
+let lastHistGts = 0;
+function recordHistory(s, expW) {
+  if (!s || s.gts === lastHistGts) return;
+  lastHistGts = s.gts;
+  const disW = s.discharge_a * s.batt_v, chgW = s.charge_a * s.batt_v;
+  const entry = {
+    // wall-clock receipt time, not gts — gts carries the server's TZ offset
+    t: Date.now(), pv: Math.round(s.pv_w), load: Math.round(s.load_w), soc: s.soc,
+    exp: Math.round(expW), grid: Math.round(Math.max(0, s.load_w - s.pv_w - disW + chgW)),
+  };
+  history.push(entry);
+  while (history.length > 2000) history.shift();
+  try { appendFileSync(CFG.HISTORY_FILE, JSON.stringify(entry) + "\n"); }
+  catch (e) { console.error("history write:", e.message); }
+}
+
+// Reload persisted samples on boot (keep 48h) and compact the file.
+try {
+  if (existsSync(CFG.HISTORY_FILE)) {
+    const cutoff = Date.now() - 48 * 3600_000;
+    for (const ln of readFileSync(CFG.HISTORY_FILE, "utf8").split("\n")) {
+      if (!ln) continue;
+      try { const p = JSON.parse(ln); if (p.t > cutoff) history.push(p); } catch {}
+    }
+    writeFileSync(CFG.HISTORY_FILE, history.map(p => JSON.stringify(p)).join("\n") + (history.length ? "\n" : ""));
+    console.log(`history: ${history.length} samples loaded`);
+  }
+} catch (e) { console.error("history load:", e.message); }
+
+// Live fetch for the dashboard: refetch when >25s old so a 30s-refresh client
+// always sees fresh cloud data, with a lock so concurrent requests share one fetch.
+let fetchLock = null;
+async function liveSnapshot() {
+  if (Date.now() - latest.fetchedAt < 25_000 && latest.snapshot) return;
+  if (!fetchLock) fetchLock = (async () => {
+    try {
+      latest.snapshot = await fetchSnapshot();
+      latest.fetchedAt = Date.now();
+      latest.error = null;
+      recordHistory(latest.snapshot, latest.expW);
+    } catch (e) { latest.error = e.message; }
+    finally { fetchLock = null; }
+  })();
+  await fetchLock;
+}
+
+// ---------- ALERTS ----------
+async function sendAlert(text) {
+  console.log(`[ALERT] ${text.replace(/\n/g, " | ")}`);
+  alertLog.unshift({ ts: Date.now(), text });
+  if (alertLog.length > 100) alertLog.pop();
+  const jobs = [];
+  if (CFG.WAHA_URL && CFG.WAHA_CHAT_ID) {
+    jobs.push(fetch(`${CFG.WAHA_URL}/api/sendText`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(CFG.WAHA_API_KEY && { "X-Api-Key": CFG.WAHA_API_KEY }) },
+      body: JSON.stringify({ session: CFG.WAHA_SESSION, chatId: CFG.WAHA_CHAT_ID, text }),
+    }).catch(e => console.error("WAHA:", e.message)));
+  }
+  if (CFG.TELEGRAM_TOKEN && CFG.TELEGRAM_CHAT_ID) {
+    jobs.push(fetch(`https://api.telegram.org/bot${CFG.TELEGRAM_TOKEN}/sendMessage`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: CFG.TELEGRAM_CHAT_ID, text }),
+    }).catch(e => console.error("Telegram:", e.message)));
+  }
+  await Promise.all(jobs);
+}
+function shouldFire(state, id) {
+  const cooled = Date.now() - (state.lastAlerts[id] || 0) > CFG.ALERT_COOLDOWN_MIN * 60_000;
+  if (cooled) state.lastAlerts[id] = Date.now();
+  return cooled;
+}
+
+// ---------- METER BUDGETS (rule 8) ----------
+// 4 FESCO meters, billing cycle 7th→7th, 200 units = protected/unprotected cliff.
+function loadMeters() {
+  let db = loadJson(CFG.METERS_FILE, null);
+  if (!db) {
+    db = { meters: [
+      { id: "usman",  name: "Usman",  protected: true,  budget: 180 },
+      { id: "razia",  name: "Razia",  protected: false, budget: 200 },
+      { id: "hamid",  name: "Hamid",  protected: false, budget: 200 },
+      { id: "majeed", name: "Majeed", protected: false, budget: 200 },
+    ], readings: [] };
+    saveJson(CFG.METERS_FILE, db);
+  }
+  if (!db.activeLog) db.activeLog = []; // changeover rotation history {meter, ts}
+  return db;
+}
+
+function activeMeterId() {
+  const log = loadMeters().activeLog;
+  return log.length ? log[log.length - 1].meter : null;
+}
+
+function cycleWindow() {
+  const [y, mo, d] = nowParts().date.split("-").map(Number);
+  let sy = y, sm = mo;
+  if (d < 7) { sm -= 1; if (sm === 0) { sm = 12; sy -= 1; } }
+  let ey = sy, em = sm + 1;
+  if (em === 13) { em = 1; ey += 1; }
+  const pad = (n) => String(n).padStart(2, "0");
+  const start = new Date(`${sy}-${pad(sm)}-07T00:00:00${CFG.UTC_OFFSET}`).getTime();
+  const end = new Date(`${ey}-${pad(em)}-07T00:00:00${CFG.UTC_OFFSET}`).getTime();
+  return { start, end, daysLeft: Math.max(0, Math.round((end - Date.now()) / 86400e3)),
+           startDate: `${sy}-${pad(sm)}-07` };
+}
+
+// Protection streak from billed-units history: 6 consecutive bills ≤200
+// units flips a meter to the protected tariff; one bill >200 resets the run.
+function protectionEta(m) {
+  if (!m.history || !m.history.length) return null;
+  const h = [...m.history].sort((a, b) => (a.month < b.month ? -1 : 1));
+  let streak = 0;
+  for (let i = h.length - 1; i >= 0; i--) { if (h[i].units <= 200) streak++; else break; }
+  const needed = Math.max(0, 6 - streak);
+  const [y, mo] = h[h.length - 1].month.split("-").map(Number);
+  const d = new Date(y, mo - 1 + needed, 1);
+  return { streak, needed, eta: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}` };
+}
+
+function computeMeters() {
+  const db = loadMeters();
+  const cycle = cycleWindow();
+  const active = db.activeLog.length ? db.activeLog[db.activeLog.length - 1].meter : null;
+  const cycleDays = loadJson(CFG.DAYS_FILE, []).filter(r => r.date >= cycle.startDate);
+  const today = loadJson(CFG.STATE_FILE, null);
+  // auto-estimated grid units attributed to this meter, this cycle
+  const estFor = (id) => +((cycleDays.reduce((s, r) => s + ((r.meterGridWh || {})[id] || 0), 0) +
+    (((today || {}).meterGridWh || {})[id] || 0)) / 1000).toFixed(1);
+  const meters = db.meters.map(m => {
+    const rs = db.readings.filter(r => r.meter === m.id).sort((a, b) => a.ts - b.ts);
+    const base = { id: m.id, name: m.name, protected: m.protected, budget: m.budget,
+      active: m.id === active, est: estFor(m.id), prot: protectionEta(m) };
+    if (!rs.length) return { ...base, noData: true };
+    const last = rs[rs.length - 1];
+    const prev = rs[rs.length - 2];
+    base.perDay = prev && (last.ts - prev.ts) > 43200e3 // needs >12h between readings
+      ? +(((last.value - prev.value) / ((last.ts - prev.ts) / 86400e3)).toFixed(1)) : null;
+    const before = [...rs].reverse().find(r => r.ts <= cycle.start); // cycle-start baseline
+    const first = rs.find(r => r.ts > cycle.start);                  // fallback: first in-cycle
+    const baseVal = before ? before.value : first.value;
+    const baseTs = before ? cycle.start : first.ts;
+    const used = Math.max(0, last.value - baseVal);
+    const elapsed = (last.ts - baseTs) / 86400e3;
+    if (elapsed < 0.25) // single fresh point — can't project a pace yet
+      return { ...base, used, projected: null, status: "new", lastValue: last.value, lastTs: last.ts };
+    const pace = used / elapsed;
+    const projected = Math.round(used + pace * Math.max(0, (cycle.end - last.ts) / 86400e3));
+    const status = projected > m.budget ? "red" : projected > 0.85 * m.budget ? "amber" : "green";
+    // Already >200 THIS cycle → streak resets now; ETA slides past the bill history
+    if (!m.protected && base.prot && used > 200) {
+      const [cy, cm] = cycle.startDate.split("-").map(Number);
+      const d = new Date(cy, cm + 6, 1); // 6 clean bills after this cycle's bill
+      base.prot = { streak: 0, needed: 6, eta: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`, liveReset: true };
+    }
+    return { ...base, used, projected, status, lastValue: last.value, lastTs: last.ts, midCycleBaseline: !before };
+  });
+  return { cycle, active, meters };
+}
+
+// ---------- PAYBACK / PR TREND / BATTERY HEALTH ----------
+function computePayback() {
+  if (!(CFG.SYSTEM_COST_RS > 0)) return null;
+  const days = loadJson(CFG.DAYS_FILE, []);
+  const today = loadJson(CFG.STATE_FILE, null);
+  const kwh = CFG.PAYBACK_BASE_KWH + days.reduce((s, d) => s + d.pvWh, 0) / 1000 + (today ? today.pvWh / 1000 : 0);
+  const savedRs = Math.round(kwh * CFG.TARIFF_RS);
+  const last7 = days.slice(-7);
+  const paceRsDay = last7.length
+    ? (last7.reduce((s, d) => s + d.pvWh, 0) / 1000) * CFG.TARIFF_RS / last7.length : 0;
+  const leftRs = Math.max(0, CFG.SYSTEM_COST_RS - savedRs);
+  return {
+    savedRs, costRs: CFG.SYSTEM_COST_RS,
+    pct: Math.min(100, +(100 * savedRs / CFG.SYSTEM_COST_RS).toFixed(1)),
+    yearsLeft: paceRsDay > 1 ? +(leftRs / paceRsDay / 365).toFixed(1) : null,
+  };
+}
+
+function prTrend(days) {
+  const valid = days.filter(d => d.expPvWh > 500); // skip no-weather days
+  if (valid.length < 3) return null;
+  const pr = (a) => Math.round(100 * a.reduce((s, d) => s + d.pvWh, 0) / Math.max(1, a.reduce((s, d) => s + d.expPvWh, 0)));
+  const pr7 = pr(valid.slice(-7));
+  const prev = valid.slice(-14, -7);
+  const prPrev7 = prev.length >= 4 ? pr(prev) : null;
+  return { pr7, prPrev7, drift: prPrev7 === null ? null : pr7 - prPrev7 };
+}
+
+function computeBattHealth() {
+  const bh = loadJson(CFG.BATT_FILE, { seg: null, estimates: [] });
+  if (!bh.estimates.length) return { samples: 0 };
+  const caps = bh.estimates.slice(-10).map(e => e.capWh).sort((a, b) => a - b);
+  const median = caps[Math.floor(caps.length / 2)];
+  return { samples: bh.estimates.length, capWh: median, pct: Math.round(100 * median / CFG.BATT_WH) };
+}
+
+function outageStats() {
+  const outs = loadJson(CFG.OUTAGES_FILE, []);
+  const state = loadJson(CFG.STATE_FILE, null);
+  const now = Date.now();
+  const all = [...outs];
+  const ongoing = !!(state && state.gridOutStart);
+  if (ongoing) all.push({ start: state.gridOutStart, end: now });
+  const midnight = new Date(`${nowParts().date}T00:00:00${CFG.UTC_OFFSET}`).getTime();
+  const weekAgo = now - 7 * 86400e3;
+  const clip = (o, from) => Math.max(0, Math.min(o.end, now) - Math.max(o.start, from));
+  return {
+    todayMin: Math.round(all.reduce((s, o) => s + clip(o, midnight), 0) / 60000),
+    weekHrs: +(all.reduce((s, o) => s + clip(o, weekAgo), 0) / 3600e3).toFixed(1),
+    weekCount: all.filter(o => o.end > weekAgo).length,
+    ongoing,
+  };
+}
+
+// The measured case for the FESCO net-metering application: units the system
+// was FORCED to waste (battery full, sun up), annualized at the export rate.
+function netMeteringCase() {
+  const rows = loadJson(CFG.DAYS_FILE, []).slice(-30);
+  const today = loadJson(CFG.STATE_FILE, null);
+  const curtWh = rows.reduce((s, d) => s + (d.curtWh || 0), 0) + (today ? (today.curtWh || 0) : 0);
+  const nDays = rows.length + (today ? 1 : 0);
+  if (!nDays) return null;
+  const kwh = curtWh / 1000;
+  return { curtKwh: +kwh.toFixed(1), nDays, rsYear: Math.round((kwh / nDays) * 365 * CFG.NM_EXPORT_RS) };
+}
+
+// Tomorrow's contiguous strong-sun hours — when to run heavy loads
+function surplusWindow(wx, todayDate) {
+  const hrs = wx.filter(x => x.date > todayDate && expectedPvW(x.ghi, x.temp) > 2000).map(x => x.hour);
+  if (!hrs.length) return null;
+  return { from: Math.min(...hrs), to: Math.max(...hrs) + 1 };
+}
+
+// ---------- RULES ----------
+function runRules(s, state, hour, expW) {
+  const alerts = [];
+  const daylight = hour >= 8 && hour <= 17;
+  const evening = hour >= 19 && hour <= 23;
+  const gridPresent = s.grid_v > 150;
+
+  // R1 — PV2 dropout
+  if (daylight && s.pv2_v < CFG.PV2_DEAD_VOLTS && s.pv1_v > 100) {
+    if (shouldFire(state, "pv2_drop"))
+      alerts.push(`🔴 PV2 STRING DROPPED\nPV2: ${s.pv2_v}V (PV1: ${s.pv1_v}V)\nCheck DC isolator / MC4.`);
+  }
+
+  // R2 — Weather-aware underperformance (curtailment-aware)
+  //     Only alert if the system actually WANTED power it didn't get:
+  //     skip when battery is full and load is already covered (legit curtailment).
+  const curtailing = s.soc >= 97 && s.pv_w >= s.load_w * 0.9;
+  if (daylight && expW > 800 && !curtailing && s.pv_w < expW * CFG.PR_ALERT) {
+    if (shouldFire(state, "underperf"))
+      alerts.push(`🟠 UNDERPERFORMING vs WEATHER\nActual: ${Math.round(s.pv_w)}W | Expected: ~${Math.round(expW)}W (${Math.round(100 * s.pv_w / expW)}%)\nPV1 ${s.pv1_w}W / PV2 ${s.pv2_w}W. Check strings/soiling.`);
+  }
+
+  // R3 — Discharge lock regression
+  if (evening && gridPresent && s.discharge_a === 0 && s.soc > CFG.EVENING_SOC_LOCK && s.load_w > 200) {
+    if (shouldFire(state, "discharge_lock"))
+      alerts.push(`🔴 BATTERY NOT DISCHARGING\nSOC ${s.soc}%, load ${s.load_w}W on grid.\nBack-to-Discharge setting may have regressed.`);
+  }
+
+  // R4 — Priority regression
+  if (daylight && s.pv_w > 1500 && /line|utility|mains/i.test(s.mode)) {
+    if (shouldFire(state, "priority_reg"))
+      alerts.push(`🟠 ON GRID DESPITE ${Math.round(s.pv_w)}W SOLAR\nMode: ${s.mode}. Verify Output Source Priority = SBU.`);
+  }
+
+  // R5 — Deep discharge with grid present
+  if (gridPresent && s.soc > 0 && s.soc < CFG.DEEP_SOC) {
+    if (shouldFire(state, "deep_soc"))
+      alerts.push(`🟠 DEEP DISCHARGE: ${s.soc}%\nGrid available — reserve floor not holding.`);
+  }
+  return alerts;
+}
+
+// ---------- EVENING SUFFICIENCY FORECAST ----------
+function eveningForecast(s, profile) {
+  const usableWh = Math.max(0, (s.soc - CFG.RESERVE_SOC) / 100) * CFG.BATT_WH * 0.92;
+  let needWh = 0;
+  const parts = [];
+  for (let h = 19; h <= 23; h++) {
+    const w = profile.seen[h] > 0 ? profile.hourlyLoadW[h] : 650; // fallback
+    needWh += w;
+    parts.push(`${h}:00 ~${Math.round(w)}W`);
+  }
+  const lastsHrs = needWh > 0 ? usableWh / (needWh / 5) : 99;
+  const verdict = usableWh >= needWh
+    ? `✅ Battery covers the evening (19:00–24:00) with margin.`
+    : `⚠️ Battery lasts ~${lastsHrs.toFixed(1)}h — grid takes over ~${(19 + lastsHrs).toFixed(0)}:00.`;
+  return `🔮 EVENING FORECAST\nSOC ${s.soc}% → ${(usableWh / 1000).toFixed(1)} kWh usable above ${CFG.RESERVE_SOC}% reserve\nExpected evening load: ${(needWh / 1000).toFixed(1)} kWh\n${verdict}`;
+}
+
+// ---------- DIGEST ----------
+function digestText(state) {
+  const pv = state.pvWh / 1000, exp = state.expPvWh / 1000;
+  const pr = exp > 0 ? Math.round(100 * pv / exp) : null;
+  const gridEst = Math.max(0, state.loadWh - state.pvWh - state.dischargeWh + state.chargeWh) / 1000;
+  return [
+    `📊 SOLAR DAILY DIGEST — ${state.date}`,
+    `☀️ Generated: ${pv.toFixed(1)} units${pr !== null ? ` (${pr}% of weather-expected ${exp.toFixed(1)})` : ""}`,
+    `🏠 Consumed: ${(state.loadWh / 1000).toFixed(1)} units`,
+    `🔋 SOC ${state.socMin}%–${state.socMax}% | discharged ${(state.dischargeWh / 1000).toFixed(1)} kWh`,
+    `⚡ Grid (est): ${gridEst.toFixed(1)} units`,
+    `💰 Est. saved: ~Rs. ${Math.round(pv * CFG.TARIFF_RS)}`,
+  ].join("\n");
+}
+
+// ---------- MAIN ----------
+async function poll() {
+  const { date, hour } = nowParts();
+  let state = loadJson(CFG.STATE_FILE, freshDay(date));
+  if (state.date !== date) {
+    // day rollover: archive yesterday's totals before resetting
+    if (state.pvWh > 0 || state.loadWh > 0) {
+      const days = loadJson(CFG.DAYS_FILE, []);
+      days.push({
+        date: state.date, pvWh: Math.round(state.pvWh), expPvWh: Math.round(state.expPvWh),
+        loadWh: Math.round(state.loadWh), dischargeWh: Math.round(state.dischargeWh),
+        chargeWh: Math.round(state.chargeWh), curtWh: Math.round(state.curtWh || 0),
+        gridWh: Math.round(state.gridWh || 0),
+        meterGridWh: Object.fromEntries(Object.entries(state.meterGridWh || {})
+          .map(([k, v]) => [k, Math.round(v)])),
+        socMin: state.socMin, socMax: state.socMax,
+      });
+      saveJson(CFG.DAYS_FILE, days);
+    }
+    const carryOutage = state.gridOutStart || null; // outage spanning midnight
+    state = freshDay(date);
+    state.gridOutStart = carryOutage;
+  }
+  const profile = loadJson(CFG.PROFILE_FILE, freshProfile());
+
+  let s;
+  try { s = await fetchSnapshot(); latest.snapshot = s; latest.fetchedAt = Date.now(); latest.error = null; }
+  catch (e) {
+    latest.error = e.message;
+    console.error(`fetch failed: ${e.message}`);
+    if (shouldFire(state, "fetch_fail")) await sendAlert(`⚪ MONITORING ISSUE\nDessMonitor unreachable: ${e.message}`);
+    saveJson(CFG.STATE_FILE, state); return;
+  }
+
+  const ageMin = (Date.now() - lastNewDataAt) / 60_000; // min since gts last ADVANCED
+  if (ageMin > CFG.STALE_MINUTES) {
+    if (shouldFire(state, "stale"))
+      await sendAlert(`⚪ DATALOGGER SILENT — no new reading for ${Math.round(ageMin)} min. Check inverter WiFi.`);
+    saveJson(CFG.STATE_FILE, state); return;
+  }
+
+  // Weather-expected output for this hour (fail-soft to 0 = rules degrade gracefully)
+  let expW = 0;
+  try {
+    const wx = await getWeather();
+    const slot = wx.find(x => x.date === date && x.hour === hour);
+    if (slot) expW = expectedPvW(slot.ghi, slot.temp);
+  } catch (e) { console.error("weather:", e.message); }
+  latest.expW = expW;
+  recordHistory(s, expW);
+
+  // Accumulate energy + learn load profile (EMA, α=0.2)
+  const hrs = CFG.POLL_MINUTES / 60;
+  state.pvWh += s.pv_w * hrs;
+  state.expPvWh += expW * hrs;
+  state.loadWh += s.load_w * hrs;
+  state.dischargeWh += s.discharge_a * s.batt_v * hrs;
+  state.chargeWh += s.charge_a * s.batt_v * hrs;
+  state.socMin = Math.min(state.socMin, s.soc);
+  state.socMax = Math.max(state.socMax, s.soc);
+
+  // Grid import (est) — total for the day, and attributed to whichever meter
+  // the changeover is currently on (set via the dashboard).
+  const gridEstW = Math.max(0, s.load_w - s.pv_w - s.discharge_a * s.batt_v + s.charge_a * s.batt_v);
+  state.gridWh = (state.gridWh || 0) + gridEstW * hrs;
+  const activeM = activeMeterId();
+  if (activeM) {
+    state.meterGridWh = state.meterGridWh || {};
+    state.meterGridWh[activeM] = (state.meterGridWh[activeM] || 0) + gridEstW * hrs;
+  }
+  profile.hourlyLoadW[hour] = profile.seen[hour] === 0 ? s.load_w
+    : 0.8 * profile.hourlyLoadW[hour] + 0.2 * s.load_w;
+  profile.seen[hour] += 1;
+
+  // Battery health: integrate each continuous discharge segment; a >=15-point
+  // SOC drop extrapolates to a full-capacity estimate (median shown in UI).
+  const bh = loadJson(CFG.BATT_FILE, { seg: null, estimates: [] });
+  if (s.discharge_a > 1) {
+    if (!bh.seg) bh.seg = { socStart: s.soc, wh: 0 };
+    bh.seg.wh += s.discharge_a * s.batt_v * hrs;
+    bh.seg.socEnd = s.soc;
+  } else if (bh.seg) {
+    const dsoc = bh.seg.socStart - (bh.seg.socEnd ?? bh.seg.socStart);
+    if (dsoc >= 15 && bh.seg.wh > 300) {
+      bh.estimates.push({ ts: Date.now(), capWh: Math.round(bh.seg.wh / (dsoc / 100)), dsoc, wh: Math.round(bh.seg.wh) });
+      while (bh.estimates.length > 200) bh.estimates.shift();
+    }
+    bh.seg = null;
+  }
+  saveJson(CFG.BATT_FILE, bh);
+
+  // Curtailment estimate: battery full + sun available but PV throttled →
+  // energy net metering would have exported instead of wasting.
+  if (s.soc >= 97 && expW > 500 && s.pv_w < expW * 0.85)
+    state.curtWh = (state.curtWh || 0) + Math.max(0, expW - s.pv_w) * hrs;
+
+  // Loadshedding tracker: log each grid outage as {start, end}
+  if (s.grid_v < 150) {
+    if (!state.gridOutStart) state.gridOutStart = Date.now();
+  } else if (state.gridOutStart) {
+    const outs = loadJson(CFG.OUTAGES_FILE, []);
+    outs.push({ start: state.gridOutStart, end: Date.now() });
+    while (outs.length > 500) outs.shift();
+    saveJson(CFG.OUTAGES_FILE, outs);
+    state.gridOutStart = null;
+  }
+
+  console.log(`[${new Date().toISOString()}] PV ${Math.round(s.pv_w)}W/${Math.round(expW)}W exp | SOC ${s.soc}% | dis ${s.discharge_a}A | load ${s.load_w}W | ${s.mode}`);
+
+  for (const a of runRules(s, state, hour, expW)) await sendAlert(a);
+
+  if (hour === CFG.FORECAST_HOUR && !state.forecastSent) {
+    await sendAlert(eveningForecast(s, profile));
+    state.forecastSent = true;
+  }
+  if (hour === CFG.DIGEST_HOUR && !state.digestSent) {
+    let extra = "";
+    try {
+      const wx = await getWeather();
+      const tom = tomorrowOutlook(wx, date);
+      if (tom) extra += `\n🔮 Tomorrow: ~${tom.kwh.toFixed(1)} units expected (midday clouds ~${tom.cloud}%)`;
+      const win = surplusWindow(wx, date);
+      if (win) extra += `\n🕐 Heavy-load window tomorrow: ${win.from}:00–${win.to}:00`;
+    } catch {}
+    const os = outageStats();
+    if (os.todayMin > 0) extra += `\n🔌 Loadshedding today: ${os.todayMin} min`;
+    if ((state.curtWh || 0) > 200)
+      extra += `\n♻️ Curtailed (wasted) today: ${(state.curtWh / 1000).toFixed(1)} units — net metering would export these`;
+    const pr = prTrend(loadJson(CFG.DAYS_FILE, []));
+    if (pr) extra += `\n📈 7-day PR: ${pr.pr7}%${pr.drift !== null ? ` (${pr.drift >= 0 ? "+" : ""}${pr.drift} vs prev week)` : ""}`;
+    const mi = computeMeters();
+    for (const m of mi.meters) {
+      if (m.noData && !(m.est > 0)) continue;
+      extra += `\n${m.active ? "⚡" : "🔢"} ${m.name}: `;
+      extra += (!m.noData && m.projected !== null)
+        ? `${m.used}u used → proj ${m.projected}/${m.budget} (auto est ~${m.est}u)`
+        : `~${m.est}u this cycle (auto est)`;
+    }
+    await sendAlert(digestText(state) + extra);
+    state.digestSent = true;
+
+    // R6b — soiling: weather-adjusted PR drifting down week-over-week
+    if (pr && pr.drift !== null && pr.drift <= -8 && pr.pr7 < 75 && shouldFire(state, "soiling"))
+      await sendAlert(`🟡 CLEANING SUGGESTED\n7-day PR ${pr.pr7}% (prev week ${pr.prPrev7}%).\nWeather-adjusted output is drifting down — likely soiling/shading.`);
+
+    // R8 — meter budget cliff
+    for (const m of mi.meters)
+      if (m.status === "red" && shouldFire(state, "meter_" + m.id))
+        await sendAlert(`🔴 METER BUDGET: ${m.name}\nProjected ${m.projected} units vs ${m.budget} cap (used ${m.used}, ${mi.cycle.daysLeft}d left in cycle).\nRotate the changeover to another meter.`);
+  }
+
+  saveJson(CFG.STATE_FILE, state);
+  saveJson(CFG.PROFILE_FILE, profile);
+
+  // Dead-man's switch: ping after every healthy cycle; the monitor service
+  // alerts you when pings STOP — i.e. when the watchdog itself dies.
+  if (CFG.HEARTBEAT_URL)
+    fetch(CFG.HEARTBEAT_URL, { signal: AbortSignal.timeout(10000) }).catch(() => {});
+}
+
+// ---------- HTTP DASHBOARD ----------
+// GET /            → single-page dashboard (inline, zero-dep)
+// GET /api/status  → JSON: live snapshot + today's accumulators + alert log
+//                    (this endpoint later becomes the Android app's backend)
+async function statusPayload() {
+  let expW = latest.expW;
+  try {
+    const wx = await getWeather();
+    const np = nowParts();
+    const slot = wx.find(x => x.date === np.date && x.hour === np.hour);
+    if (slot) { expW = expectedPvW(slot.ghi, slot.temp); latest.expW = expW; }
+  } catch {}
+  await liveSnapshot();
+  const s = latest.snapshot;
+  const dischargeW = s ? s.discharge_a * s.batt_v : 0;
+  const chargeW = s ? s.charge_a * s.batt_v : 0;
+  const profile = loadJson(CFG.PROFILE_FILE, freshProfile());
+  return {
+    now: Date.now(), fetchedAt: latest.fetchedAt, freshAt: lastNewDataAt, error: latest.error,
+    snapshot: s, expW: Math.round(expW),
+    usableWh: s ? Math.round(Math.max(0, (s.soc - CFG.RESERVE_SOC) / 100) * CFG.BATT_WH * 0.92) : 0,
+    gridW: s ? Math.round(Math.max(0, s.load_w - s.pv_w - dischargeW + chargeW)) : 0,
+    battW: Math.round(chargeW - dischargeW),
+    today: loadJson(CFG.STATE_FILE, null),
+    history: history.filter(p => p.t > Date.now() - 12 * 3600_000),
+    days: loadJson(CFG.DAYS_FILE, []).slice(-30),
+    profile: profile.hourlyLoadW.map(Math.round), seen: profile.seen,
+    metersInfo: computeMeters(),
+    payback: computePayback(),
+    battHealth: computeBattHealth(),
+    prTrend: prTrend(loadJson(CFG.DAYS_FILE, [])),
+    outages: outageStats(),
+    netMetering: netMeteringCase(),
+    alerts: alertLog.slice(0, 20),
+    cfg: { reserveSoc: CFG.RESERVE_SOC, battWh: CFG.BATT_WH, tz: CFG.TZ,
+           tariff: CFG.TARIFF_RS, nmExportRs: CFG.NM_EXPORT_RS },
+  };
+}
+
+// ---------- REPORTS (day / week / month) ----------
+function reportRows(granularity) {
+  const all = [...loadJson(CFG.DAYS_FILE, [])];
+  const today = loadJson(CFG.STATE_FILE, null);
+  if (today && (today.pvWh > 0 || today.loadWh > 0)) all.push({ ...today, partial: true });
+  const outs = loadJson(CFG.OUTAGES_FILE, []);
+  const outHrsFor = (dateStr) => {
+    const start = new Date(`${dateStr}T00:00:00${CFG.UTC_OFFSET}`).getTime();
+    const end = start + 86400e3;
+    return outs.reduce((s, o) => s + Math.max(0, Math.min(o.end, end) - Math.max(o.start, start)), 0) / 3600e3;
+  };
+  const keyFor = (d) => {
+    if (granularity === "month") return d.date.slice(0, 7);
+    if (granularity === "week") { // key = Monday of that week
+      const dt = new Date(`${d.date}T12:00:00Z`);
+      const mon = new Date(dt.getTime() - ((dt.getUTCDay() + 6) % 7) * 86400e3);
+      return mon.toISOString().slice(0, 10);
+    }
+    return d.date;
+  };
+  const groups = new Map();
+  for (const d of all) {
+    const k = keyFor(d);
+    if (!groups.has(k)) groups.set(k, { period: k, days: 0, pvWh: 0, expPvWh: 0, loadWh: 0,
+      gridWh: 0, dischargeWh: 0, chargeWh: 0, curtWh: 0, outageH: 0, partial: false });
+    const g = groups.get(k);
+    g.days++;
+    g.pvWh += d.pvWh; g.expPvWh += d.expPvWh || 0; g.loadWh += d.loadWh;
+    g.gridWh += d.gridWh !== undefined ? d.gridWh
+      : Math.max(0, d.loadWh - d.pvWh - (d.dischargeWh || 0) + (d.chargeWh || 0));
+    g.dischargeWh += d.dischargeWh || 0; g.chargeWh += d.chargeWh || 0;
+    g.curtWh += d.curtWh || 0; g.outageH += outHrsFor(d.date);
+    if (d.partial) g.partial = true;
+  }
+  return [...groups.values()].sort((a, b) => (a.period < b.period ? 1 : -1)).slice(0, 31).map(g => ({
+    period: g.period, days: g.days, partial: g.partial,
+    gen: +(g.pvWh / 1000).toFixed(1), exp: +(g.expPvWh / 1000).toFixed(1),
+    pr: g.expPvWh > 500 ? Math.round(100 * g.pvWh / g.expPvWh) : null,
+    load: +(g.loadWh / 1000).toFixed(1), grid: +(g.gridWh / 1000).toFixed(1),
+    battOut: +(g.dischargeWh / 1000).toFixed(1), battIn: +(g.chargeWh / 1000).toFixed(1),
+    curt: +(g.curtWh / 1000).toFixed(1), outageH: +g.outageH.toFixed(1),
+    savedRs: Math.round((g.pvWh / 1000) * CFG.TARIFF_RS),
+  }));
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let b = "";
+    req.on("data", c => { b += c; if (b.length > 1e4) req.destroy(); });
+    req.on("end", () => resolve(b));
+    req.on("error", reject);
+  });
+}
+
+async function handleMeterPost(req, res) {
+  res.setHeader("Content-Type", "application/json");
+  try {
+    const { meter, value, date } = JSON.parse(await readBody(req) || "{}");
+    const db = loadMeters();
+    const m = db.meters.find(x => x.id === meter);
+    const v = Number(value);
+    if (!m || !Number.isFinite(v) || v < 0) { res.statusCode = 400; return res.end(JSON.stringify({ error: "bad meter or value" })); }
+    // Optional backdating (one-time history import, bill dates): "YYYY-MM-DD"
+    let ts = Date.now();
+    const backdated = !!date;
+    if (backdated) {
+      ts = new Date(`${date}T09:00:00${CFG.UTC_OFFSET}`).getTime();
+      if (!Number.isFinite(ts)) { res.statusCode = 400; return res.end(JSON.stringify({ error: "bad date — use YYYY-MM-DD" })); }
+      if (ts > Date.now()) { res.statusCode = 400; return res.end(JSON.stringify({ error: "date is in the future" })); }
+    }
+    const rs = db.readings.filter(r => r.meter === meter).sort((a, b) => a.ts - b.ts);
+    // Chronological sanity against BOTH neighbours (matters for backfill)
+    const before = [...rs].reverse().find(r => r.ts <= ts);
+    const after = rs.find(r => r.ts > ts);
+    if (before && v < before.value) { res.statusCode = 400; return res.end(JSON.stringify({ error: `below the earlier reading (${before.value}) — meters only count up` })); }
+    if (after && v > after.value) { res.statusCode = 400; return res.end(JSON.stringify({ error: `above the later reading (${after.value}) — meters only count up` })); }
+    // Idle-meter guard (live logs only): a meter never on the changeover
+    // since its last reading should not have moved. Movement = wiring/theft check.
+    if (!backdated && before && db.activeLog.length && v - before.value > 3) {
+      let wasActive = false;
+      for (let i = 0; i < db.activeLog.length; i++) {
+        const to = i + 1 < db.activeLog.length ? db.activeLog[i + 1].ts : Date.now();
+        if (db.activeLog[i].meter === meter && to > before.ts) wasActive = true;
+      }
+      if (!wasActive)
+        await sendAlert(`🟠 IDLE METER MOVED: ${m.name}\n+${v - before.value} units since last reading, but it was never the active meter.\nCheck the changeover wiring — idle meters should not count.`);
+    }
+    db.readings.push({ meter, ts, value: v });
+    db.readings.sort((a, b) => a.ts - b.ts);
+    saveJson(CFG.METERS_FILE, db);
+    const info = computeMeters();
+    const st = info.meters.find(x => x.id === meter);
+    if (st && st.status === "red")
+      await sendAlert(`🔴 METER BUDGET: ${st.name}\nProjected ${st.projected} units vs ${st.budget} cap (${info.cycle.daysLeft}d left in cycle).\nRotate the changeover to another meter.`);
+    res.end(JSON.stringify({ ok: true, meter: st }));
+  } catch (e) { res.statusCode = 500; res.end(JSON.stringify({ error: e.message })); }
+}
+
+const DASHBOARD_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Solar Watchdog</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0b0f14">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<style>
+:root{--bg:#0b0f14;--card:#121924;--line:#1e2936;--txt:#e7eef6;--dim:#8fa1b3;
+--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--accent:#38bdf8}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);
+font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:22px 16px 48px}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+h1{font-size:17px;font-weight:650;margin:0;letter-spacing:.01em}
+.chip{font-size:12px;font-weight:600;padding:3px 10px;border-radius:99px;
+background:#16241d;color:var(--ok);border:1px solid #1e3a2c}
+.chip.line{background:#2a2214;color:var(--warn);border-color:#453718}
+.live{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;
+color:var(--ok);letter-spacing:.12em}
+.live i{width:8px;height:8px;border-radius:99px;background:var(--ok);animation:pu 2s infinite}
+@keyframes pu{0%{box-shadow:0 0 0 0 rgba(52,211,153,.5)}
+70%{box-shadow:0 0 0 7px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
+.upd{margin-left:auto;color:var(--dim);font-size:12.5px;text-align:right}
+.upd .dot{display:inline-block;width:7px;height:7px;border-radius:99px;
+background:var(--ok);margin-right:6px;vertical-align:1px}
+.upd.stale .dot{background:var(--bad)}
+.cd{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(215px,1fr))}
+.g2{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:15px 16px}
+.k{font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);margin-bottom:6px}
+.v{font-size:29px;font-weight:650;font-variant-numeric:tabular-nums;line-height:1.15}
+.v small{font-size:15px;font-weight:500;color:var(--dim)}
+.sub{color:var(--dim);font-size:12.5px;margin-top:5px}
+.bar{height:5px;border-radius:99px;background:#1a2430;margin-top:10px;overflow:hidden}
+.bar i{display:block;height:100%;border-radius:99px;background:var(--accent);transition:width .6s}
+.soc{display:flex;align-items:center;gap:14px}
+.ring{width:64px;height:64px;border-radius:50%;flex:none;display:grid;place-items:center;
+font-size:15px;font-weight:650;font-variant-numeric:tabular-nums}
+.ring b{background:var(--card);width:50px;height:50px;border-radius:50%;
+display:grid;place-items:center;font-weight:650}
+.rows{display:grid;gap:8px}
+.row{display:flex;justify-content:space-between;font-size:13.5px;gap:10px}
+.row span:first-child{color:var(--dim)}
+.row b{font-variant-numeric:tabular-nums;white-space:nowrap}
+.st{display:inline-block;width:8px;height:8px;border-radius:99px;margin-right:7px;vertical-align:0}
+.st.ok{background:var(--ok)}.st.bad{background:var(--bad)}
+.frow{display:flex;justify-content:space-between;align-items:center;gap:10px;
+padding:9px 2px;border-bottom:1px solid var(--line);font-size:14px}
+.frow:last-child{border-bottom:none}
+.frow .val{font-variant-numeric:tabular-nums;font-weight:650;white-space:nowrap}
+.frow.on .val{color:var(--accent)}
+.frow.chg .val{color:var(--ok)}
+.frow.warn .val{color:var(--warn)}
+.frow.bad .val{color:var(--bad)}
+.frow.off{opacity:.45}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px;font-size:12px;color:var(--dim)}
+.legend i{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:5px;vertical-align:2px}
+.alerts{margin-top:2px}
+.alert{padding:10px 12px;border:1px solid var(--line);border-radius:10px;
+margin-bottom:8px;font-size:13.5px;white-space:pre-line}
+.alert time{display:block;color:var(--dim);font-size:11.5px;margin-bottom:3px}
+.empty{color:var(--dim);font-size:13.5px;padding:6px 2px}
+section{margin-top:22px}
+h2{font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);
+font-weight:600;margin:0 0 10px}
+.verdict{font-size:14px;margin-top:10px}
+.tbtn{background:transparent;border:1px solid var(--line);color:var(--dim);
+border-radius:8px;padding:5px 12px;font-size:12px;cursor:pointer}
+.tbtn.on{background:#14283c;border-color:#24405c;color:var(--accent);font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+th,td{padding:6px 8px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+th:first-child,td:first-child{text-align:left}
+tr:last-child td{border-bottom:none}
+</style></head><body><div class="wrap">
+<header>
+  <h1>☀️ Solar Watchdog</h1>
+  <span class="chip" id="mode">—</span>
+  <span class="live"><i></i>LIVE</span>
+  <span class="upd" id="upd"><span class="dot"></span>connecting…<br>
+  <span class="cd" id="cd"></span></span>
+</header>
+
+<div class="grid">
+  <div class="card"><div class="k">Solar Now</div>
+    <div class="v" id="pv">—</div>
+    <div class="sub" id="pvsub">expected —</div>
+    <div class="bar"><i id="prbar" style="width:0%"></i></div></div>
+  <div class="card"><div class="k">Battery</div>
+    <div class="soc"><div class="ring" id="ring"><b id="soc">—</b></div>
+    <div><div class="v" id="battflow" style="font-size:19px">—</div>
+    <div class="sub" id="battsub">—</div></div></div></div>
+  <div class="card"><div class="k">House Load</div>
+    <div class="v" id="load">—</div>
+    <div class="sub" id="gridsub">grid —</div></div>
+  <div class="card"><div class="k">Today</div>
+    <div class="v" id="units">—<small> units</small></div>
+    <div class="sub" id="todaysub">—</div></div>
+  <div class="card" id="pb_card" style="display:none"><div class="k">Payback</div>
+    <div class="v" id="pb_v" style="font-size:24px">—</div>
+    <div class="sub" id="pb_sub">—</div>
+    <div class="bar"><i id="pb_bar" style="width:0%;background:var(--ok)"></i></div></div>
+</div>
+
+<section><h2>Power Flow</h2><div class="card">
+  <div class="frow" id="f_solar"><span>☀️ Solar</span><span class="val" id="f_solar_v">—</span></div>
+  <div class="frow" id="f_batt"><span>🔋 Battery</span><span class="val" id="f_batt_v">—</span></div>
+  <div class="frow" id="f_grid"><span>⚡ Grid</span><span class="val" id="f_grid_v">—</span></div>
+</div></section>
+
+<section><h2>Last 12 Hours</h2><div class="card">
+  <div class="legend">
+    <span><i style="background:#38bdf8"></i>Solar</span>
+    <span><i style="background:#8fa1b3"></i>Expected</span>
+    <span><i style="background:#fbbf24"></i>Load</span>
+    <span><i style="background:#34d399"></i>SOC</span>
+  </div>
+  <div id="chart"><div class="empty">Collecting data…</div></div>
+</div></section>
+
+<div class="g2" style="margin-top:22px">
+  <div><h2>Strings</h2><div class="card"><div class="rows">
+    <div class="row"><span><i class="st ok" id="st1"></i>PV1 · 8×585W</span><b id="pv1">—</b></div>
+    <div class="row"><span><i class="st ok" id="st2"></i>PV2 · 6×620W (watch)</span><b id="pv2">—</b></div>
+  </div></div></div>
+  <div><h2>System</h2><div class="card"><div class="rows">
+    <div class="row"><span>Battery voltage</span><b id="sy_bv">—</b></div>
+    <div class="row"><span>Battery current</span><b id="sy_ba">—</b></div>
+    <div class="row"><span>Grid voltage</span><b id="sy_gv">—</b></div>
+    <div class="row"><span>Usable above reserve</span><b id="sy_us">—</b></div>
+    <div class="row"><span>Battery capacity (est.)</span><b id="sy_cap">learning…</b></div>
+    <div class="row"><span>7-day performance</span><b id="sy_pr">collecting…</b></div>
+  </div></div></div>
+</div>
+
+<section><h2>FESCO Meters <span id="mcycle" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+<div class="grid" id="meters"><div class="empty">Loading…</div></div></section>
+
+<section><h2>Decision Support</h2><div class="g2">
+  <div class="card"><div class="k">Loadshedding</div>
+    <div class="v" id="out_v" style="font-size:22px">—</div>
+    <div class="sub" id="out_sub">tracking grid outages via grid voltage</div></div>
+  <div class="card"><div class="k">Net-Metering Case</div>
+    <div class="v" id="nm_v" style="font-size:22px">—</div>
+    <div class="sub" id="nm_sub">curtailed solar the grid could be buying</div></div>
+</div></section>
+
+<section><h2>Last 30 Days</h2><div class="card">
+  <div class="legend">
+    <span><i style="background:#38bdf8"></i>Generated</span>
+    <span><i style="background:#8fa1b3"></i>Expected</span>
+    <span><i style="background:#fbbf24"></i>Consumed</span>
+  </div>
+  <div id="month"><div class="empty">First daily summary lands at midnight tonight.</div></div>
+</div></section>
+
+<section><h2>Evening Plan (19:00–24:00)</h2><div class="card">
+  <div class="rows">
+    <div class="row"><span>Battery available now</span><b id="ev_have">—</b></div>
+    <div class="row"><span>Typical evening load</span><b id="ev_need">—</b></div>
+  </div>
+  <div class="verdict" id="ev_verdict">—</div>
+</div></section>
+
+<section><h2>Reports — Solar · Battery · Grid</h2><div class="card">
+  <div style="display:flex;gap:6px;margin-bottom:12px">
+    <button class="tbtn on" data-g="day" onclick="loadReport(this.dataset.g)">Daily</button>
+    <button class="tbtn" data-g="week" onclick="loadReport(this.dataset.g)">Weekly</button>
+    <button class="tbtn" data-g="month" onclick="loadReport(this.dataset.g)">Monthly</button>
+  </div>
+  <div id="report" style="overflow-x:auto"><div class="empty">Loading…</div></div>
+</div></section>
+
+<section><h2>Alerts</h2><div class="alerts" id="alerts">
+  <div class="empty">Loading…</div></div></section>
+</div>
+
+<script>
+var REFRESH = 30, cd = REFRESH;
+function fmtW(w){ return Math.abs(w) >= 1000 ? (w/1000).toFixed(2) + ' kW' : Math.round(w) + ' W'; }
+function ago(ts){ var m = (Date.now()-ts)/60000;
+  return m < 1 ? 'just now' : m < 60 ? Math.round(m) + ' min ago' : (m/60).toFixed(1) + ' h ago'; }
+function el(id){ return document.getElementById(id); }
+function setFlow(id, cls, text){ el(id).className = 'frow ' + cls; el(id + '_v').textContent = text; }
+
+function renderMeters(info){
+  el('mcycle').textContent = '· ' + info.cycle.daysLeft + ' days left in cycle (7th → 7th)' +
+    (info.active ? '' : ' · tap SET ACTIVE on the meter your changeover is on');
+  el('meters').innerHTML = info.meters.map(function(m){
+    var col = m.status === 'red' ? 'var(--bad)' : m.status === 'amber' ? 'var(--warn)' : 'var(--ok)';
+    var auto = m.est > 0 ? '<div class="sub">auto grid est this cycle: ~' + m.est + ' u' +
+      (m.perDay !== null && m.perDay !== undefined ? ' · ~' + m.perDay + ' u/day from readings' : '') + '</div>' : '';
+    var prot = '';
+    if (m.prot){
+      prot = m.protected
+        ? '<div class="sub" style="color:var(--ok)">🛡 protected · ' + m.prot.streak + ' clean bills — stay ≤ ' + m.budget + '</div>'
+        : '<div class="sub" style="color:' + (m.prot.streak > 0 ? 'var(--warn)' : 'var(--bad)') + '">' +
+          '🛡 in ' + m.prot.needed + ' clean bill' + (m.prot.needed === 1 ? '' : 's') +
+          ' (streak ' + m.prot.streak + '/6 · protected after ' + m.prot.eta + ' bill)' +
+          (m.prot.liveReset ? ' — THIS cycle >200, streak resets' : '') + '</div>';
+    }
+    var body;
+    if (m.noData){
+      body = '<div class="sub" style="margin:8px 0 2px">no readings yet — log the 7th-of-month baseline</div>' + auto + prot;
+    } else if (m.projected === null){
+      body = '<div class="v" style="font-size:22px">' + m.used + '<small> used</small></div>' +
+        '<div class="sub">baseline ' + m.lastValue + ' set · log again in a few days for a projection</div>' + auto + prot;
+    } else {
+      body = '<div class="v" style="font-size:22px">' + m.used + '<small> used → ' + m.projected + ' projected</small></div>' +
+        '<div class="sub">budget ' + m.budget + ' · last reading ' + m.lastValue +
+        (m.midCycleBaseline ? ' · partial (mid-cycle baseline)' : '') + '</div>' + auto + prot +
+        '<div class="bar"><i style="width:' + Math.min(100, Math.round(100*m.projected/m.budget)) + '%;background:' + col + '"></i></div>';
+    }
+    var actBtn = m.active
+      ? '<span style="align-self:center;font-size:11px;font-weight:700;color:var(--ok);letter-spacing:.06em;white-space:nowrap">⚡ ACTIVE</span>'
+      : '<button data-m="' + m.id + '" onclick="setActive(this.dataset.m)" ' +
+        'style="background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:6px 9px;font-size:11px;cursor:pointer;white-space:nowrap">SET ACTIVE</button>';
+    return '<div class="card"' + (m.active ? ' style="border-color:#2b5e46"' : '') + '><div class="k">' +
+      m.name + (m.protected ? ' 🛡 protected' : '') + '</div>' + body +
+      '<div style="display:flex;gap:6px;margin-top:10px">' +
+      '<input id="mi_' + m.id + '" type="number" inputmode="numeric" placeholder="meter reading" ' +
+      'style="flex:1;min-width:0;background:#0e141c;border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:6px 9px;font-size:13px">' +
+      '<button data-m="' + m.id + '" onclick="logMeter(this.dataset.m)" ' +
+      'style="background:#14283c;border:1px solid #24405c;color:var(--accent);border-radius:8px;padding:6px 12px;font-size:12.5px;cursor:pointer">Log</button>' +
+      actBtn + '</div>' +
+      '<div style="display:flex;gap:8px;margin-top:6px;align-items:center">' +
+      '<input id="md_' + m.id + '" type="date" ' +
+      'style="background:#0e141c;border:1px solid var(--line);border-radius:8px;color:var(--dim);padding:4px 8px;font-size:12px">' +
+      '<span class="sub" style="margin:0">optional — backdate (bill / past reading)</span>' +
+      '</div></div>';
+  }).join('');
+}
+
+var repG = 'day';
+async function loadReport(g){
+  if (g) repG = g;
+  document.querySelectorAll('.tbtn').forEach(function(b){
+    b.className = 'tbtn' + (b.dataset.g === repG ? ' on' : ''); });
+  var d = await (await fetch('/api/report?g=' + repG)).json();
+  var box = el('report');
+  if (!d.rows.length){
+    box.innerHTML = '<div class="empty">No completed days yet — rows appear after each midnight.</div>';
+    return;
+  }
+  var label = repG === 'day' ? 'Date' : repG === 'week' ? 'Week of' : 'Month';
+  var h = '<table><tr><th>' + label + '</th><th>Solar u</th><th>Expected</th><th>PR%</th>' +
+    '<th>House u</th><th>Grid u</th><th>Batt out</th><th>Batt in</th>' +
+    '<th>Wasted</th><th>Outage h</th><th>Saved Rs</th></tr>';
+  d.rows.forEach(function(r){
+    h += '<tr><td>' + r.period + (r.partial ? ' •' : '') + '</td>' +
+      '<td><b style="color:var(--accent)">' + r.gen + '</b></td>' +
+      '<td>' + r.exp + '</td>' +
+      '<td>' + (r.pr === null ? '—' : '<span style="color:' + (r.pr >= 65 ? 'var(--ok)' : 'var(--bad)') + '">' + r.pr + '</span>') + '</td>' +
+      '<td>' + r.load + '</td><td>' + r.grid + '</td>' +
+      '<td>' + r.battOut + '</td><td>' + r.battIn + '</td>' +
+      '<td>' + (r.curt > 0 ? '<span style="color:var(--warn)">' + r.curt + '</span>' : '0') + '</td>' +
+      '<td>' + r.outageH + '</td><td>' + r.savedRs.toLocaleString() + '</td></tr>';
+  });
+  box.innerHTML = h + '</table><div class="sub" style="margin-top:8px">• period still in progress · units = kWh · saved @ Rs ' +
+    (window.__tariff || 45) + '/unit</div>';
+}
+
+async function setActive(id){
+  await fetch('/api/meter/active', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ meter: id }) });
+  load();
+}
+
+function drawMonth(days){
+  if (!days || !days.length) return;
+  var W = 820, H = 200, B = 18, T = 8;
+  var n = days.length, slot = (W - 20) / n, bw = Math.max(6, Math.floor(slot) - 4);
+  var max = 1;
+  days.forEach(function(d){ max = Math.max(max, d.pvWh, d.expPvWh || 0, d.loadWh); });
+  var svg = '';
+  days.forEach(function(d, i){
+    var x = 10 + i * slot;
+    var h = (H-B-T) * d.pvWh / max, he = (H-B-T) * (d.expPvWh || 0) / max, hl = (H-B-T) * d.loadWh / max;
+    svg += '<rect x="' + x.toFixed(1) + '" y="' + (H-B-h).toFixed(1) + '" width="' + bw + '" height="' + Math.max(1, h).toFixed(1) + '" rx="2" fill="#38bdf8" opacity=".85"/>';
+    svg += '<rect x="' + x.toFixed(1) + '" y="' + (H-B-he).toFixed(1) + '" width="' + bw + '" height="1.5" fill="#8fa1b3"/>';
+    svg += '<rect x="' + x.toFixed(1) + '" y="' + (H-B-hl).toFixed(1) + '" width="' + bw + '" height="1.5" fill="#fbbf24"/>';
+    if (i === 0 || i === n-1 || i % 7 === 0)
+      svg += '<text x="' + (x + bw/2).toFixed(1) + '" y="' + (H-4) + '" fill="#8fa1b3" font-size="9" text-anchor="middle">' + d.date.slice(5) + '</text>';
+  });
+  el('month').innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto">' + svg + '</svg>';
+}
+
+async function logMeter(id){
+  var inp = el('mi_' + id);
+  if (!inp.value) return;
+  var dt = el('md_' + id).value;
+  var r = await fetch('/api/meter', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ meter: id, value: Number(inp.value), date: dt || undefined }) });
+  var j = await r.json();
+  if (j.error) { alert(j.error); } else { load(); }
+}
+
+function drawChart(hist){
+  if (!hist || hist.length < 2){
+    el('chart').innerHTML = '<div class="empty">Collecting data… (chart appears after a few datalogger uploads)</div>';
+    return;
+  }
+  var W = 820, H = 230, L = 8, R = 8, B = 20, T = 8;
+  var t0 = hist[0].t, t1 = hist[hist.length-1].t;
+  var ymax = 600;
+  hist.forEach(function(p){ ymax = Math.max(ymax, p.pv, p.exp, p.load); });
+  ymax *= 1.08;
+  function X(t){ return L + (W-L-R) * (t-t0) / Math.max(1, t1-t0); }
+  function Y(v){ return H-B - (H-B-T) * (v/ymax); }
+  function Ys(soc){ return H-B - (H-B-T) * (soc/100); }
+  function path(key){ return hist.map(function(p,i){
+    return (i ? 'L' : 'M') + X(p.t).toFixed(1) + ' ' + Y(p[key]).toFixed(1); }).join(' '); }
+  var area = path('pv') + ' L' + X(t1).toFixed(1) + ' ' + (H-B) + ' L' + X(t0).toFixed(1) + ' ' + (H-B) + ' Z';
+  var socPath = hist.map(function(p,i){
+    return (i ? 'L' : 'M') + X(p.t).toFixed(1) + ' ' + Ys(p.soc).toFixed(1); }).join(' ');
+  var labels = '';
+  for (var k = 0; k <= 4; k++){
+    var tt = t0 + (t1-t0) * k / 4;
+    var anchor = k === 0 ? 'start' : k === 4 ? 'end' : 'middle';
+    labels += '<text x="' + X(tt).toFixed(0) + '" y="' + (H-5) + '" fill="#8fa1b3" font-size="10" text-anchor="' + anchor + '">' +
+      new Date(tt).toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'}) + '</text>';
+  }
+  el('chart').innerHTML =
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto;display:block">' +
+    '<path d="' + area + '" fill="rgba(56,189,248,.12)"/>' +
+    '<path d="' + path('pv') + '" stroke="#38bdf8" fill="none" stroke-width="2" stroke-linejoin="round"/>' +
+    '<path d="' + path('exp') + '" stroke="#8fa1b3" fill="none" stroke-width="1.5" stroke-dasharray="5 4"/>' +
+    '<path d="' + path('load') + '" stroke="#fbbf24" fill="none" stroke-width="1.5"/>' +
+    '<path d="' + socPath + '" stroke="#34d399" fill="none" stroke-width="1.5" opacity=".85"/>' +
+    labels + '</svg>';
+}
+
+async function load(){
+  var d;
+  try { d = await (await fetch('/api/status')).json(); }
+  catch(e){ el('upd').innerHTML = 'dashboard unreachable'; cd = REFRESH; return; }
+  cd = REFRESH;
+  var s = d.snapshot;
+  var upd = el('upd');
+  if (!s){ upd.className = 'upd stale';
+    upd.innerHTML = '<span class="dot"></span>' + (d.error || 'no data yet') +
+      '<br><span class="cd" id="cd"></span>'; return; }
+  var dataTs = d.freshAt || d.fetchedAt; // when the inverter reading last changed
+  upd.className = 'upd' + (Date.now()-dataTs > 30*60000 ? ' stale' : '');
+  upd.innerHTML = '<span class="dot"></span>reading ' + ago(dataTs) +
+    ' · inverter uploads ~5 min<br><span class="cd" id="cd"></span>';
+
+  var mode = el('mode');
+  mode.textContent = s.mode;
+  mode.className = 'chip' + (/line|utility|mains/i.test(s.mode) ? ' line' : '');
+
+  el('pv').textContent = fmtW(s.pv_w);
+  var pct = d.expW > 100 ? Math.round(100*s.pv_w/d.expW) : null;
+  el('pvsub').textContent =
+    d.expW > 0 ? 'expected ~' + fmtW(d.expW) + (pct !== null ? ' · ' + pct + '%' : '') : 'night / no sun expected';
+  el('prbar').style.width = Math.min(100, pct || 0) + '%';
+  el('prbar').style.background = pct === null || pct >= 65 ? 'var(--accent)' : 'var(--bad)';
+
+  el('soc').textContent = Math.round(s.soc) + '%';
+  el('ring').style.background = 'conic-gradient(var(--ok) ' + (s.soc*3.6) + 'deg, #1a2430 0)';
+  var flow = s.charge_a > 0.5 ? '⬆ ' + s.charge_a.toFixed(1) + ' A in'
+           : s.discharge_a > 0.5 ? '⬇ ' + s.discharge_a.toFixed(1) + ' A out' : 'idle';
+  el('battflow').textContent = flow;
+  el('battsub').textContent =
+    (d.usableWh/1000).toFixed(1) + ' kWh usable above ' + d.cfg.reserveSoc + '% · ' + s.batt_v.toFixed(1) + ' V';
+
+  el('load').textContent = fmtW(s.load_w);
+  el('gridsub').textContent = s.grid_v > 150
+    ? 'grid present · importing ~' + fmtW(d.gridW) : 'GRID DOWN · on battery';
+
+  // Power flow lanes
+  setFlow('f_solar', s.pv_w > 50 ? 'on' : 'off',
+    s.pv_w > 50 ? fmtW(s.pv_w) + (d.battW > 50 ? ' → house + battery' : ' → house') : 'asleep');
+  setFlow('f_batt',
+    d.battW > 50 ? 'chg' : d.battW < -50 ? 'warn' : 'off',
+    d.battW > 50 ? '⬆ charging ' + fmtW(d.battW)
+      : d.battW < -50 ? '⬇ powering house ' + fmtW(-d.battW) : 'idle');
+  setFlow('f_grid',
+    s.grid_v <= 150 ? 'bad' : d.gridW > 50 ? 'warn' : 'off',
+    s.grid_v <= 150 ? 'DOWN — on battery' : d.gridW > 50 ? 'importing ' + fmtW(d.gridW) : 'standby ~0 W');
+
+  drawChart(d.history);
+
+  var t = d.today;
+  if (t){
+    var pvU = t.pvWh/1000, expU = t.expPvWh/1000;
+    el('units').innerHTML = pvU.toFixed(1) + '<small> units</small>';
+    el('todaysub').textContent =
+      (expU > 0.2 ? Math.round(100*pvU/expU) + '% of expected · ' : '') +
+      'saved ~Rs. ' + Math.round(pvU*d.cfg.tariff).toLocaleString() +
+      (t.gridWh !== undefined ? ' · grid ~' + (t.gridWh/1000).toFixed(1) + 'u' : '') +
+      (t.socMax >= t.socMin ? ' · SOC ' + t.socMin + '–' + t.socMax + '%' : '');
+  }
+
+  if (d.payback){
+    el('pb_card').style.display = '';
+    el('pb_v').textContent = 'Rs ' + d.payback.savedRs.toLocaleString();
+    el('pb_sub').textContent = d.payback.pct + '% of Rs ' + d.payback.costRs.toLocaleString() +
+      (d.payback.yearsLeft !== null ? ' · ~' + d.payback.yearsLeft + ' yr left' : '');
+    el('pb_bar').style.width = d.payback.pct + '%';
+  }
+
+  el('sy_cap').textContent = d.battHealth.samples
+    ? (d.battHealth.capWh/1000).toFixed(2) + ' kWh (' + d.battHealth.pct + '% of rated) · ' + d.battHealth.samples + ' samples'
+    : 'learning — needs a deep discharge';
+  el('sy_pr').textContent = d.prTrend
+    ? d.prTrend.pr7 + '%' + (d.prTrend.drift !== null
+        ? ' (' + (d.prTrend.drift >= 0 ? '+' : '') + d.prTrend.drift + ' vs prev wk)' : '')
+    : 'collecting… (needs 3+ days)';
+
+  renderMeters(d.metersInfo);
+
+  if (d.outages){
+    el('out_v').textContent = d.outages.todayMin + ' min today' + (d.outages.ongoing ? ' · OUT NOW' : '');
+    el('out_sub').textContent = d.outages.weekHrs + ' h across ' + d.outages.weekCount + ' outages in 7 days';
+  }
+  if (d.netMetering){
+    el('nm_v').textContent = d.netMetering.curtKwh + ' units wasted';
+    el('nm_sub').textContent = 'last ' + d.netMetering.nDays + 'd · ≈ Rs ' +
+      d.netMetering.rsYear.toLocaleString() + '/yr at Rs ' + d.cfg.nmExportRs + '/unit export';
+  }
+  drawMonth(d.days);
+  window.__tariff = d.cfg.tariff;
+  if (!window.__repInit){ window.__repInit = 1; loadReport(); }
+
+  el('pv1').textContent = Math.round(s.pv1_v) + ' V · ' + fmtW(s.pv1_w);
+  el('pv2').textContent = Math.round(s.pv2_v) + ' V · ' + fmtW(s.pv2_w);
+  var h = new Date().getHours();
+  el('st1').className = 'st ' + (s.pv1_v > 100 || h < 8 || h > 17 ? 'ok' : 'bad');
+  el('st2').className = 'st ' + (s.pv2_v > 50  || h < 8 || h > 17 ? 'ok' : 'bad');
+
+  el('sy_bv').textContent = s.batt_v.toFixed(1) + ' V';
+  el('sy_ba').textContent = s.charge_a > 0.5 ? '+' + s.charge_a.toFixed(1) + ' A (charging)'
+    : s.discharge_a > 0.5 ? '−' + s.discharge_a.toFixed(1) + ' A (discharging)' : '0 A';
+  el('sy_gv').textContent = Math.round(s.grid_v) + ' V';
+  el('sy_us').textContent = (d.usableWh/1000).toFixed(1) + ' kWh';
+
+  // Evening plan from the learned load profile (650W fallback per unseen hour)
+  var need = 0;
+  for (var hh = 19; hh <= 23; hh++) need += d.seen[hh] > 0 ? d.profile[hh] : 650;
+  el('ev_have').textContent = (d.usableWh/1000).toFixed(1) + ' kWh (above ' + d.cfg.reserveSoc + '% reserve)';
+  el('ev_need').textContent = (need/1000).toFixed(1) + ' kWh' +
+    (d.seen.slice(19,24).some(function(x){return x>0;}) ? ' (learned)' : ' (estimate — still learning)');
+  el('ev_verdict').textContent = d.usableWh >= need
+    ? '✅ Battery covers the evening with margin.'
+    : '⚠️ Battery lasts ~' + (d.usableWh/(need/5)).toFixed(1) + ' h — grid takes over around ' +
+      Math.min(24, Math.round(19 + d.usableWh/(need/5))) + ':00.';
+
+  var box = el('alerts');
+  if (!d.alerts.length){ box.innerHTML = '<div class="empty">No alerts since start ✅</div>'; }
+  else {
+    box.innerHTML = d.alerts.map(function(a){
+      return '<div class="alert"><time>' +
+        new Date(a.ts).toLocaleString('en-GB', {timeZone: d.cfg.tz}) + '</time>' +
+        a.text.replace(/</g, '&lt;') + '</div>';
+    }).join('');
+  }
+}
+setInterval(function(){
+  cd = Math.max(0, cd - 1);
+  var c = document.getElementById('cd');
+  if (c) c.textContent = 'refresh in ' + cd + 's';
+}, 1000);
+load(); setInterval(load, REFRESH * 1000);
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
+</script></body></html>`;
+
+const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="22" fill="#0b0f14"/><circle cx="50" cy="44" r="15" fill="#fbbf24"/><g stroke="#fbbf24" stroke-width="5" stroke-linecap="round"><line x1="50" y1="17" x2="50" y2="24"/><line x1="50" y1="64" x2="50" y2="71"/><line x1="23" y1="44" x2="30" y2="44"/><line x1="70" y1="44" x2="77" y2="44"/><line x1="31" y1="25" x2="36" y2="30"/><line x1="64" y1="58" x2="69" y2="63"/><line x1="69" y1="25" x2="64" y2="30"/><line x1="36" y1="58" x2="31" y2="63"/></g><path d="M44 76 L60 76 L48 94 L52 82 L40 82 Z" fill="#38bdf8"/></svg>`;
+
+// ---------- DASHBOARD AUTH ----------
+// Cookie survives restarts (token derived from the password, not process state)
+const sessionToken = () => CFG.DASH_PASSWORD
+  ? createHmac("sha256", CFG.DASH_PASSWORD).update("solar-watchdog-session").digest("hex") : "";
+const isAuthed = (req) => !CFG.DASH_PASSWORD ||
+  (req.headers.cookie || "").includes("dw_auth=" + sessionToken());
+
+const LOGIN_HTML = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Solar Watchdog</title>
+<style>body{margin:0;display:grid;place-items:center;min-height:100vh;background:#0b0f14;
+color:#e7eef6;font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.box{background:#121924;border:1px solid #1e2936;border-radius:16px;padding:28px;
+width:min(320px,88vw);text-align:center}
+input{width:100%;box-sizing:border-box;background:#0e141c;border:1px solid #1e2936;
+border-radius:10px;color:#e7eef6;padding:10px 12px;font-size:15px;margin:16px 0 10px}
+button{width:100%;background:#14283c;border:1px solid #24405c;color:#38bdf8;
+border-radius:10px;padding:10px;font-size:14px;font-weight:600;cursor:pointer}
+.err{color:#f87171;font-size:13px;min-height:18px;margin-top:8px}</style></head><body>
+<div class="box"><div style="font-size:30px">☀️</div><b>Solar Watchdog</b>
+<input id="pw" type="password" placeholder="password" autofocus>
+<button onclick="go()">Unlock</button><div class="err" id="err"></div></div>
+<script>
+async function go(){
+  var r = await fetch('/api/login', { method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ password: document.getElementById('pw').value }) });
+  if (r.ok) location.reload();
+  else document.getElementById('err').textContent = 'Wrong password';
+}
+document.getElementById('pw').addEventListener('keydown', function(e){ if (e.key === 'Enter') go(); });
+</script></body></html>`;
+
+if (CFG.HTTP_PORT > 0) {
+  createServer(async (req, res) => {
+    // public routes (no data): PWA assets + login
+    if (req.method === "POST" && req.url.startsWith("/api/login")) {
+      res.setHeader("Content-Type", "application/json");
+      try {
+        const { password } = JSON.parse(await readBody(req) || "{}");
+        if (CFG.DASH_PASSWORD && password === CFG.DASH_PASSWORD) {
+          res.setHeader("Set-Cookie", `dw_auth=${sessionToken()}; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax`);
+          return res.end(JSON.stringify({ ok: true }));
+        }
+        res.statusCode = 401;
+        return res.end(JSON.stringify({ error: "wrong password" }));
+      } catch (e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
+    }
+    if (req.url.startsWith("/manifest.json") || req.url.startsWith("/sw.js") || req.url.startsWith("/icon.svg")) {
+      // fall through to handlers below
+    } else if (!isAuthed(req)) {
+      if (req.url.startsWith("/api/")) {
+        res.statusCode = 401; res.setHeader("Content-Type", "application/json");
+        return res.end(JSON.stringify({ error: "unauthorized" }));
+      }
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      return res.end(LOGIN_HTML);
+    }
+    if (req.method === "POST" && req.url.startsWith("/api/meter/active")) {
+      res.setHeader("Content-Type", "application/json");
+      try {
+        const { meter } = JSON.parse(await readBody(req) || "{}");
+        const db = loadMeters();
+        if (!db.meters.find(x => x.id === meter)) { res.statusCode = 400; return res.end(JSON.stringify({ error: "unknown meter" })); }
+        db.activeLog.push({ meter, ts: Date.now() });
+        while (db.activeLog.length > 1000) db.activeLog.shift();
+        saveJson(CFG.METERS_FILE, db);
+        return res.end(JSON.stringify({ ok: true, active: meter }));
+      } catch (e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
+    }
+    if (req.method === "POST" && req.url.startsWith("/api/meter")) {
+      return handleMeterPost(req, res);
+    }
+    if (req.url.startsWith("/manifest.json")) {
+      res.setHeader("Content-Type", "application/manifest+json");
+      return res.end(JSON.stringify({
+        name: "Solar Watchdog", short_name: "Solar", start_url: "/", display: "standalone",
+        background_color: "#0b0f14", theme_color: "#0b0f14",
+        icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" }],
+      }));
+    }
+    if (req.url.startsWith("/sw.js")) {
+      res.setHeader("Content-Type", "application/javascript");
+      return res.end("self.addEventListener('install',()=>self.skipWaiting());self.addEventListener('fetch',()=>{});");
+    }
+    if (req.url.startsWith("/icon.svg")) {
+      res.setHeader("Content-Type", "image/svg+xml");
+      return res.end(ICON_SVG);
+    }
+    if (req.url.startsWith("/api/report")) {
+      const g = new URL(req.url, "http://x").searchParams.get("g") || "day";
+      res.setHeader("Content-Type", "application/json");
+      return res.end(JSON.stringify({ granularity: g, rows: reportRows(g) }));
+    }
+    if (req.url.startsWith("/api/status")) {
+      try { res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify(await statusPayload())); }
+      catch (e) { res.statusCode = 500; res.end(JSON.stringify({ error: e.message })); }
+    } else {
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.end(DASHBOARD_HTML);
+    }
+  }).listen(CFG.HTTP_PORT, () => console.log(`Dashboard: http://localhost:${CFG.HTTP_PORT}`));
+}
+
+console.log(`Solar Watchdog v2 — every ${CFG.POLL_MINUTES} min | site ${CFG.LAT},${CFG.LON} | array ${CFG.KWP_W}W`);
+poll();
+setInterval(poll, CFG.POLL_MINUTES * 60_000);

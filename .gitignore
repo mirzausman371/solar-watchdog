@@ -1,0 +1,18 @@
+# credentials — NEVER commit (DessMonitor login, dashboard password, signed URL)
+.env
+
+# runtime data (server/local state, personal meter & billing data)
+state.json
+profile.json
+history.jsonl
+days.json
+meters.json
+batt.json
+outages.json
+
+# deploy helper state
+.deploy-target
+.deploy-status
+
+*.log
+.DS_Store
