@@ -81,6 +81,7 @@ const CFG = {
   TUYA_ROLE: process.env.TUYA_ROLE || "grid",     // grid = breaker measures WAPDA import; house = total consumption
   TUYA_KWH_SCALE: num(process.env.TUYA_KWH_SCALE, 100),   // raw→kWh divisor (TOMZN usually 100); calibrate on first read
   TUYA_KWH_FILE: process.env.TUYA_KWH_FILE || join(DIR, "tuya.json"),
+  TUYA_CONTROL: process.env.TUYA_CONTROL === "1",         // enable WRITE commands to the breaker (can cut the house)
   HTTP_PORT: num(process.env.HTTP_PORT, 8080), // 0 disables the dashboard
   PUBLIC_URL: (process.env.PUBLIC_URL || "https://solar.skillmatch.tech").replace(/\/+$/, ""),
 };
@@ -241,6 +242,27 @@ async function tuyaStatus() {
   const j = await res.json();
   if (!j.success) { tuyaAuth.token = null; throw new Error(`Tuya status err ${j.code}: ${j.msg}`); }
   return j.result; // [{code, value}, ...]
+}
+
+// Write commands to the breaker (POST is signed over the body hash too)
+async function tuyaCommand(commands) {
+  if (!CFG.TUYA_ID || !CFG.TUYA_DEVICE) throw new Error("Tuya not configured");
+  if (!tuyaAuth.token || Date.now() > tuyaAuth.expireAt) await tuyaToken();
+  const t = Date.now().toString();
+  const path = `/v1.0/devices/${CFG.TUYA_DEVICE}/commands`;
+  const body = JSON.stringify({ commands });
+  const bodyHash = createHash("sha256").update(body).digest("hex");
+  const strToSign = `POST\n${bodyHash}\n\n${path}`;
+  const sign = tuyaSign(CFG.TUYA_ID + tuyaAuth.token + t + strToSign);
+  const res = await fetch(tuyaHost() + path, {
+    method: "POST",
+    headers: { client_id: CFG.TUYA_ID, access_token: tuyaAuth.token, sign, t,
+      sign_method: "HMAC-SHA256", "Content-Type": "application/json" },
+    body, signal: AbortSignal.timeout(15000),
+  });
+  const j = await res.json();
+  if (!j.success) throw new Error(`Tuya cmd err ${j.code}: ${j.msg}`);
+  return j.result;
 }
 
 // This TOMZN model packs live V/I/P into an 8-byte base64 blob (phase_a):
@@ -880,6 +902,7 @@ async function statusPayload() {
     gridW: s ? Math.round(Math.max(0, s.load_w - s.pv_w - dischargeW + chargeW)) : 0,
     battW: Math.round(chargeW - dischargeW),
     tuya: latest.tuya || null, tuyaErr: latest.tuyaErr || null, tuyaRole: CFG.TUYA_ROLE,
+    tuyaControl: CFG.TUYA_CONTROL,
     today: loadJson(CFG.STATE_FILE, null),
     history: history.filter(p => p.t > Date.now() - 12 * 3600_000),
     days: loadJson(CFG.DAYS_FILE, []).slice(-30),
@@ -1147,7 +1170,19 @@ tr:last-child td{border-bottom:none}
   <div class="card"><div class="k">Live</div><div class="rows" id="brk_live" style="margin-top:8px"></div></div>
 </div>
 <div class="card" style="margin-top:12px"><div class="k">Configuration &amp; Protection</div>
-  <div class="rows" id="brk_cfg" style="margin-top:10px"></div></div></section>
+  <div class="rows" id="brk_cfg" style="margin-top:10px"></div>
+  <div id="brk_controls" style="display:none;margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+    <div class="k">Controls</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:9px;align-items:center">
+      <button class="tbtn" onclick="breakerCmd('supply',true)">Supply ON</button>
+      <button class="tbtn" style="border-color:#5c2424;color:#f87171" onclick="breakerCmd('supply',false,'Turn OFF the whole-house supply? This blacks out the house.')">Supply OFF</button>
+      <button class="tbtn" onclick="breakerCmd('protect',null,'Top up the breaker so it cuts at the active meter&#39;s budget?')">Set for active meter</button>
+      <input id="brk_topup" type="number" inputmode="numeric" placeholder="units" style="width:78px;background:#0e141c;border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:5px 8px;font-size:13px">
+      <button class="tbtn" onclick="topupBreaker()">Top up</button>
+    </div>
+    <div class="sub" id="brk_ctl_msg" style="margin-top:8px"></div>
+  </div>
+</div></section>
 
 <section><h2>FESCO Meters <span id="mcycle" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
 <div class="grid" id="meters"><div class="empty">Loading…</div></div></section>
@@ -1283,6 +1318,23 @@ async function setActive(id){
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ meter: id }) });
   load();
+}
+
+async function breakerCmd(action, value, confirmMsg){
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  var msg = el('brk_ctl_msg'); if (msg) msg.textContent = 'sending…';
+  try {
+    var r = await fetch('/api/breaker', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: action, value: value }) });
+    var j = await r.json();
+    if (j.error) { if (msg) msg.textContent = '⚠️ ' + j.error; }
+    else { if (msg) msg.textContent = '✅ ' + (j.note || 'done'); setTimeout(load, 1500); }
+  } catch(e){ if (msg) msg.textContent = '⚠️ ' + e.message; }
+}
+function topupBreaker(){
+  var n = el('brk_topup').value;
+  if (n) breakerCmd('topup', Number(n), 'Add ' + n + ' units to the breaker balance?');
 }
 
 function drawMonth(days){
@@ -1533,6 +1585,7 @@ async function load(){
     (tk.protections || []).forEach(function(p){ cfg.push([p.label + (p.on ? '' : ' (off)'), p.value + ' ' + p.unit]); });
     el('brk_cfg').innerHTML = cfg.map(function(r){ return '<div class="row"><span>' + r[0] + '</span><b>' + r[1] + '</b></div>'; }).join('') +
       '<div class="sub" style="margin-top:6px">protection thresholds decoded from the breaker — confirm against the Smart Life app</div>';
+    el('brk_controls').style.display = d.tuyaControl ? '' : 'none';
   }
 
   window.__tariff = d.cfg.tariff;
@@ -1638,6 +1691,35 @@ if (CFG.HTTP_PORT > 0) {
       }
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       return res.end(LOGIN_HTML);
+    }
+    if (req.method === "POST" && req.url.startsWith("/api/breaker")) {
+      res.setHeader("Content-Type", "application/json");
+      if (!CFG.TUYA_CONTROL) { res.statusCode = 403; return res.end(JSON.stringify({ error: "breaker control disabled — set TUYA_CONTROL=1 to enable" })); }
+      try {
+        const { action, value } = JSON.parse(await readBody(req) || "{}");
+        let commands, note;
+        if (action === "supply") { commands = [{ code: "switch", value: !!value }]; note = `supply ${value ? "ON" : "OFF"}`; }
+        else if (action === "prepay") { commands = [{ code: "switch_prepayment", value: !!value }]; note = `prepayment ${value ? "ON" : "OFF"}`; }
+        else if (action === "topup") {
+          const n = Math.round(Number(value));
+          if (!(n > 0 && n <= 1000)) { res.statusCode = 400; return res.end(JSON.stringify({ error: "top-up must be 1–1000 units" })); }
+          commands = [{ code: "charge_energy", value: n }]; note = `topped up ${n} units`;
+        } else if (action === "protect") {
+          const info = computeMeters(); const m = info.meters.find(x => x.active);
+          if (!m) { res.statusCode = 400; return res.end(JSON.stringify({ error: "no active meter set" })); }
+          const used = m.meas > 0 ? m.meas : m.est;
+          const target = Math.max(0, m.budget - used);
+          const cur = latest.tuya && latest.tuya.balance != null ? latest.tuya.balance : 0;
+          const add = Math.round(target - cur);
+          if (add <= 0) return res.end(JSON.stringify({ ok: true, noCommand: true, note: `Balance ${cur.toFixed(1)}u already ≥ target ${target}u for ${m.name}. Reduce it in the Smart Life app if you need it lower.` }));
+          commands = [{ code: "charge_energy", value: add }];
+          note = `topped up ${add}u → ~${target}u so the breaker cuts at ${m.name}'s ${m.budget}-unit budget (used ${used}u)`;
+        } else { res.statusCode = 400; return res.end(JSON.stringify({ error: "unknown action" })); }
+        await tuyaCommand(commands);
+        latest.tuya = null; // force a fresh read next poll
+        await sendAlert(`🔧 BREAKER CONTROL: ${note} (via dashboard)`);
+        return res.end(JSON.stringify({ ok: true, note }));
+      } catch (e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
     }
     if (req.method === "POST" && req.url.startsWith("/api/meter/active")) {
       res.setHeader("Content-Type", "application/json");
