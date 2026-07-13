@@ -104,7 +104,7 @@ function loadJson(f, fallback) { if (existsSync(f)) { try { return JSON.parse(re
 function saveJson(f, o) { writeFileSync(f, JSON.stringify(o, null, 2)); }
 function freshDay(date) {
   return { date, pvWh: 0, expPvWh: 0, loadWh: 0, dischargeWh: 0, chargeWh: 0, curtWh: 0,
-           gridWh: 0, meterGridWh: {}, gridMeasWh: 0, meterMeasWh: {},
+           gridWh: 0, meterGridWh: {}, gridMeasWh: 0, meterMeasWh: {}, gridDirectWh: 0,
            socMin: 100, socMax: 0, gridOutStart: null,
            lastAlerts: {}, digestSent: false, forecastSent: false };
 }
@@ -379,10 +379,14 @@ function recordHistory(s, expW) {
   if (!s || s.gts === lastHistGts) return;
   lastHistGts = s.gts;
   const disW = s.discharge_a * s.batt_v, chgW = s.charge_a * s.batt_v;
+  const gridEst = Math.max(0, s.load_w - s.pv_w - disW + chgW);
+  const gm = latest.tuya && latest.tuya.power != null ? Math.round(latest.tuya.power) : null;
+  const gridDirect = gm != null ? Math.max(0, gm - gridEst) : 0;   // load bypassing the inverter
   const entry = {
     // wall-clock receipt time, not gts — gts carries the server's TZ offset
     t: Date.now(), pv: Math.round(s.pv_w), load: Math.round(s.load_w), soc: s.soc,
-    exp: Math.round(expW), grid: Math.round(Math.max(0, s.load_w - s.pv_w - disW + chgW)),
+    exp: Math.round(expW), grid: Math.round(gridEst),
+    gm, total: Math.round(s.load_w + gridDirect),   // true whole-house consumption
   };
   history.push(entry);
   while (history.length > 2000) history.shift();
@@ -418,6 +422,22 @@ async function liveSnapshot() {
     finally { fetchLock = null; }
   })();
   await fetchLock;
+}
+
+// Same live-refresh for the TOMZN breaker — without this the dashboard only saw
+// the 10-min poll's reading and lagged the Smart Life app by minutes.
+let tuyaLiveLock = null;
+async function tuyaLive() {
+  if (!CFG.TUYA_ID || !CFG.TUYA_DEVICE) return;
+  if (latest.tuya && Date.now() - (latest.tuya.ts || 0) < 25_000) return;
+  if (!tuyaLiveLock) tuyaLiveLock = (async () => {
+    try {
+      const st = await tuyaStatus();
+      if (st) { latest.tuya = { ...tuyaParse(st), ts: Date.now() }; latest.tuyaErr = null; }
+    } catch (e) { latest.tuyaErr = e.message; }
+    finally { tuyaLiveLock = null; }
+  })();
+  await tuyaLiveLock;
 }
 
 // ---------- ALERTS ----------
@@ -699,6 +719,7 @@ async function poll() {
         loadWh: Math.round(state.loadWh), dischargeWh: Math.round(state.dischargeWh),
         chargeWh: Math.round(state.chargeWh), curtWh: Math.round(state.curtWh || 0),
         gridWh: Math.round(state.gridWh || 0), gridMeasWh: Math.round(state.gridMeasWh || 0),
+        gridDirectWh: Math.round(state.gridDirectWh || 0),
         meterGridWh: Object.fromEntries(Object.entries(state.meterGridWh || {})
           .map(([k, v]) => [k, Math.round(v)])),
         meterMeasWh: Object.fromEntries(Object.entries(state.meterMeasWh || {})
@@ -803,6 +824,10 @@ async function poll() {
     if (st) {
       const tp = tuyaParse(st);
       latest.tuya = { ...tp, ts: Date.now() }; latest.tuyaErr = null;
+      // Grid-direct (load bypassing the inverter) → true total consumption
+      const gEst = Math.max(0, s.load_w - s.pv_w - s.discharge_a * s.batt_v + s.charge_a * s.batt_v);
+      const gDirect = tp.power != null ? Math.max(0, tp.power - gEst) : 0;
+      state.gridDirectWh = (state.gridDirectWh || 0) + gDirect * hrs;
       // Cumulative kWh delta → today's measured grid + the active meter.
       // Only when role=grid (breaker reads WAPDA import, not total consumption).
       if (CFG.TUYA_ROLE === "grid" && tp.kwh !== null) {
@@ -891,21 +916,26 @@ async function statusPayload() {
     if (slot) { expW = expectedPvW(slot.ghi, slot.temp); latest.expW = expW; }
   } catch {}
   await liveSnapshot();
+  await tuyaLive();
   const s = latest.snapshot;
   const dischargeW = s ? s.discharge_a * s.batt_v : 0;
   const chargeW = s ? s.charge_a * s.batt_v : 0;
+  const gridW = s ? Math.round(Math.max(0, s.load_w - s.pv_w - dischargeW + chargeW)) : 0;
+  const tuyaW = latest.tuya && latest.tuya.power != null ? latest.tuya.power : null;
+  const gridDirectNow = tuyaW != null ? Math.max(0, Math.round(tuyaW - gridW)) : 0;
   const profile = loadJson(CFG.PROFILE_FILE, freshProfile());
   return {
     now: Date.now(), fetchedAt: latest.fetchedAt, freshAt: lastNewDataAt, error: latest.error,
     snapshot: s, expW: Math.round(expW),
     usableWh: s ? Math.round(Math.max(0, (s.soc - CFG.RESERVE_SOC) / 100) * CFG.BATT_WH * 0.92) : 0,
-    gridW: s ? Math.round(Math.max(0, s.load_w - s.pv_w - dischargeW + chargeW)) : 0,
+    gridW: gridW,
     battW: Math.round(chargeW - dischargeW),
     tuya: latest.tuya || null, tuyaErr: latest.tuyaErr || null, tuyaRole: CFG.TUYA_ROLE,
     tuyaControl: CFG.TUYA_CONTROL,
+    gridDirectW: gridDirectNow, totalW: s ? Math.round(s.load_w + gridDirectNow) : 0,
     today: loadJson(CFG.STATE_FILE, null),
-    history: history.filter(p => p.t > Date.now() - 12 * 3600_000),
-    days: loadJson(CFG.DAYS_FILE, []).slice(-30),
+    history: history.filter(p => p.t > Date.now() - 48 * 3600_000),
+    days: loadJson(CFG.DAYS_FILE, []).slice(-180),
     profile: profile.hourlyLoadW.map(Math.round), seen: profile.seen,
     metersInfo: computeMeters(),
     payback: computePayback(),
@@ -1113,7 +1143,7 @@ tr:last-child td{border-bottom:none}
     <div class="soc"><div class="ring" id="ring"><b id="soc">—</b></div>
     <div><div class="v" id="battflow" style="font-size:19px">—</div>
     <div class="sub" id="battsub">—</div></div></div></div>
-  <div class="card"><div class="k">House Load</div>
+  <div class="card"><div class="k">Total Consumption</div>
     <div class="v" id="load">—</div>
     <div class="sub" id="gridsub">grid —</div></div>
   <div class="card"><div class="k">Today</div>
@@ -1136,13 +1166,16 @@ tr:last-child td{border-bottom:none}
   <div id="mix"><div class="empty">Gathering today's energy…</div></div>
 </div></section>
 
-<section><h2>Last 12 Hours</h2><div class="card">
-  <div class="legend">
-    <span><i style="background:#38bdf8"></i>Solar</span>
-    <span><i style="background:#8fa1b3"></i>Expected</span>
-    <span><i style="background:#fbbf24"></i>Load</span>
-    <span><i style="background:#34d399"></i>SOC</span>
+<section><h2>Consumption History</h2><div class="card">
+  <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">
+    <button class="tbtn on" data-r="12h" onclick="setRange(this.dataset.r)">12h</button>
+    <button class="tbtn" data-r="24h" onclick="setRange(this.dataset.r)">24h</button>
+    <button class="tbtn" data-r="48h" onclick="setRange(this.dataset.r)">48h</button>
+    <button class="tbtn" data-r="7d" onclick="setRange(this.dataset.r)">7d</button>
+    <button class="tbtn" data-r="30d" onclick="setRange(this.dataset.r)">30d</button>
+    <button class="tbtn" data-r="all" onclick="setRange(this.dataset.r)">All</button>
   </div>
+  <div class="legend" id="hist_legend"></div>
   <div id="chart"><div class="empty">Collecting data…</div></div>
 </div></section>
 
@@ -1196,14 +1229,6 @@ tr:last-child td{border-bottom:none}
     <div class="sub" id="nm_sub">curtailed solar the grid could be buying</div></div>
 </div></section>
 
-<section><h2>Last 30 Days</h2><div class="card">
-  <div class="legend">
-    <span><i style="background:#38bdf8"></i>Generated</span>
-    <span><i style="background:#8fa1b3"></i>Expected</span>
-    <span><i style="background:#fbbf24"></i>Consumed</span>
-  </div>
-  <div id="month"><div class="empty">First daily summary lands at midnight tonight.</div></div>
-</div></section>
 
 <section><h2>Evening Plan (19:00–24:00)</h2><div class="card">
   <div class="rows">
@@ -1337,13 +1362,14 @@ function topupBreaker(){
   if (n) breakerCmd('topup', Number(n), 'Add ' + n + ' units to the breaker balance?');
 }
 
-function drawMonth(days){
-  if (!days || !days.length) return;
-  var W = 820, H = 220, L = 34, R = 10, B = 22, T = 16;
-  var n = days.length, slot = (W-L-R) / n, bw = Math.max(6, Math.floor(slot) - 4);
+function drawDailyChart(days){
+  if (!days || !days.length){ el('chart').innerHTML = '<div class="empty">No completed days yet — daily bars appear after midnight.</div>'; return; }
+  var W = 820, H = 250, L = 36, R = 10, B = 24, T = 16;
+  var n = days.length, slot = (W-L-R) / n, bw = Math.max(4, Math.floor(slot) - 4);
+  var cons = function(d){ return (d.loadWh + (d.gridDirectWh || 0)) / 1000; }; // true total consumption
   var max = 1;
-  days.forEach(function(d){ max = Math.max(max, d.pvWh, d.expPvWh || 0, d.loadWh); });
-  max = max / 1000 * 1.15;
+  days.forEach(function(d){ max = Math.max(max, d.pvWh/1000, cons(d)); });
+  max *= 1.15;
   function Y(kwh){ return H-B - (H-B-T) * (kwh/max); }
   var grid = '', yl = '';
   for (var g = 0; g <= 3; g++){
@@ -1351,18 +1377,37 @@ function drawMonth(days){
     grid += '<line x1="' + L + '" y1="' + y.toFixed(1) + '" x2="' + (W-R) + '" y2="' + y.toFixed(1) + '" stroke="#1e2936" stroke-width="1"/>';
     yl += '<text x="' + (L-6) + '" y="' + (y+3).toFixed(1) + '" fill="#8fa1b3" font-size="10" text-anchor="end">' + yv.toFixed(0) + '</text>';
   }
-  var svg = '', step = Math.max(1, Math.ceil(n/8));
+  var svg = '', step = Math.max(1, Math.ceil(n/9)), half = bw/2;
   days.forEach(function(d, i){
-    var x = L + i * slot + 2, gen = d.pvWh/1000;
-    svg += '<rect x="' + x.toFixed(1) + '" y="' + Y(gen).toFixed(1) + '" width="' + bw + '" height="' + Math.max(1, (H-B)-Y(gen)).toFixed(1) + '" rx="2" fill="#38bdf8" opacity=".9"/>';
-    svg += '<rect x="' + x.toFixed(1) + '" y="' + Y((d.expPvWh||0)/1000).toFixed(1) + '" width="' + bw + '" height="1.5" fill="#8fa1b3"/>';
-    svg += '<rect x="' + x.toFixed(1) + '" y="' + Y(d.loadWh/1000).toFixed(1) + '" width="' + bw + '" height="1.5" fill="#fbbf24"/>';
-    if (n <= 16) svg += '<text x="' + (x + bw/2).toFixed(1) + '" y="' + (Y(gen)-3).toFixed(1) + '" fill="#e7eef6" font-size="8.5" text-anchor="middle">' + gen.toFixed(0) + '</text>';
+    var x = L + i * slot + 2, gen = d.pvWh/1000, use = cons(d), grd = (d.gridMeasWh || d.gridWh || 0)/1000;
+    // generation bar (left half) + consumption bar (right half)
+    svg += '<rect x="' + x.toFixed(1) + '" y="' + Y(gen).toFixed(1) + '" width="' + half + '" height="' + Math.max(1,(H-B)-Y(gen)).toFixed(1) + '" fill="#38bdf8" opacity=".9"/>';
+    svg += '<rect x="' + (x+half).toFixed(1) + '" y="' + Y(use).toFixed(1) + '" width="' + half + '" height="' + Math.max(1,(H-B)-Y(use)).toFixed(1) + '" fill="#fbbf24" opacity=".85"/>';
+    svg += '<rect x="' + x.toFixed(1) + '" y="' + Y(grd).toFixed(1) + '" width="' + bw + '" height="1.5" fill="#f472b6"/>';
     if (i === 0 || i === n-1 || i % step === 0)
-      svg += '<text x="' + (x + bw/2).toFixed(1) + '" y="' + (H-6) + '" fill="#8fa1b3" font-size="9" text-anchor="middle">' + d.date.slice(5) + '</text>';
+      svg += '<text x="' + (x + half).toFixed(1) + '" y="' + (H-6) + '" fill="#8fa1b3" font-size="9" text-anchor="middle">' + d.date.slice(5) + '</text>';
   });
-  el('month').innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto">' +
+  el('chart').innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto">' +
     grid + yl + '<text x="4" y="11" fill="#8fa1b3" font-size="10">kWh</text>' + svg + '</svg>';
+}
+
+var histRange = '12h';
+function setRange(r){
+  histRange = r;
+  document.querySelectorAll('[data-r]').forEach(function(b){ b.className = 'tbtn' + (b.dataset.r === r ? ' on' : ''); });
+  if (window.__data) drawHistory(window.__data);
+}
+function drawHistory(d){
+  var fine = { '12h': 12, '24h': 24, '48h': 48 };
+  if (fine[histRange]){
+    var since = Date.now() - fine[histRange] * 3600000;
+    drawFineChart((d.history || []).filter(function(p){ return p.t > since; }));
+    el('hist_legend').innerHTML = legendHtml([['#38bdf8','Solar'],['#8fa1b3','Expected'],['#f472b6','Total use'],['#fbbf24','Inverter load'],['#34d399','SOC']]);
+  } else {
+    var nDays = histRange === '7d' ? 7 : histRange === '30d' ? 30 : 999;
+    drawDailyChart((d.days || []).slice(-nDays));
+    el('hist_legend').innerHTML = legendHtml([['#38bdf8','Generated'],['#fbbf24','Consumed'],['#f472b6','Grid']]);
+  }
 }
 
 async function logMeter(id){
@@ -1377,21 +1422,23 @@ async function logMeter(id){
 }
 
 function fmtKw(w){ return w >= 1000 ? (w/1000).toFixed(1) + 'k' : String(Math.round(w)); }
-function drawChart(hist){
+function legendHtml(items){ return items.map(function(it){ return '<span><i style="background:'+it[0]+'"></i>'+it[1]+'</span>'; }).join(''); }
+function drawFineChart(hist){
   if (!hist || hist.length < 2){
-    el('chart').innerHTML = '<div class="empty">Collecting data… (chart appears after a few datalogger uploads)</div>';
+    el('chart').innerHTML = '<div class="empty">Collecting data… (chart fills in as the logger uploads)</div>';
     return;
   }
   var W = 820, H = 250, L = 44, R = 12, B = 24, T = 12;
   var t0 = hist[0].t, t1 = hist[hist.length-1].t;
   var ymax = 600;
-  hist.forEach(function(p){ ymax = Math.max(ymax, p.pv, p.exp, p.load); });
+  hist.forEach(function(p){ ymax = Math.max(ymax, p.pv, p.exp, p.load, p.total || 0); });
   ymax *= 1.1;
   function X(t){ return L + (W-L-R) * (t-t0) / Math.max(1, t1-t0); }
   function Y(v){ return H-B - (H-B-T) * (v/ymax); }
   function Ys(soc){ return H-B - (H-B-T) * (soc/100); }
   function path(key){ return hist.map(function(p,i){
-    return (i ? 'L' : 'M') + X(p.t).toFixed(1) + ' ' + Y(p[key]).toFixed(1); }).join(' '); }
+    var v = key === 'total' ? (p.total != null ? p.total : p.load) : p[key];
+    return (i ? 'L' : 'M') + X(p.t).toFixed(1) + ' ' + Y(v).toFixed(1); }).join(' '); }
   // y-axis: left = Watts, right = SOC %
   var grid = '', yl = '';
   for (var g = 0; g <= 4; g++){
@@ -1417,7 +1464,8 @@ function drawChart(hist){
     '<path d="' + area + '" fill="rgba(56,189,248,.12)"/>' +
     '<path d="' + path('pv') + '" stroke="#38bdf8" fill="none" stroke-width="2" stroke-linejoin="round"/>' +
     '<path d="' + path('exp') + '" stroke="#8fa1b3" fill="none" stroke-width="1.5" stroke-dasharray="5 4"/>' +
-    '<path d="' + path('load') + '" stroke="#fbbf24" fill="none" stroke-width="1.5"/>' +
+    '<path d="' + path('total') + '" stroke="#f472b6" fill="none" stroke-width="2"/>' +
+    '<path d="' + path('load') + '" stroke="#fbbf24" fill="none" stroke-width="1.5" opacity=".8"/>' +
     '<path d="' + socPath + '" stroke="#34d399" fill="none" stroke-width="1.5" opacity=".85"/>' +
     yl + xl + '</svg>';
 }
@@ -1479,9 +1527,10 @@ async function load(){
   el('battsub').textContent =
     (d.usableWh/1000).toFixed(1) + ' kWh usable above ' + d.cfg.reserveSoc + '% · ' + s.batt_v.toFixed(1) + ' V';
 
-  el('load').textContent = fmtW(s.load_w);
-  el('gridsub').textContent = s.grid_v > 150
-    ? 'grid present · importing ~' + fmtW(d.gridW) : 'GRID DOWN · on battery';
+  el('load').textContent = fmtW(d.totalW || s.load_w);
+  el('gridsub').textContent = d.gridDirectW > 30
+    ? 'inverter ' + fmtW(s.load_w) + ' + grid-direct ' + fmtW(d.gridDirectW)
+    : 'all via inverter · ' + (s.grid_v > 150 ? 'grid present' : 'grid down');
 
   // Power flow lanes
   setFlow('f_solar', s.pv_w > 50 ? 'on' : 'off',
@@ -1503,7 +1552,8 @@ async function load(){
     setFlow('f_meter', 'bad', 'not reading — ' + d.tuyaErr);
   }
 
-  drawChart(d.history);
+  window.__data = d;
+  drawHistory(d);
 
   var t = d.today;
   if (t){
@@ -1543,7 +1593,6 @@ async function load(){
     el('nm_sub').textContent = 'last ' + d.netMetering.nDays + 'd · ≈ Rs ' +
       d.netMetering.rsYear.toLocaleString() + '/yr at Rs ' + d.cfg.nmExportRs + '/unit export';
   }
-  drawMonth(d.days);
 
   if (d.today){
     drawPie([
