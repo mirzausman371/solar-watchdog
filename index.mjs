@@ -82,6 +82,15 @@ const CFG = {
   TUYA_KWH_SCALE: num(process.env.TUYA_KWH_SCALE, 100),   // raw→kWh divisor (TOMZN usually 100); calibrate on first read
   TUYA_KWH_FILE: process.env.TUYA_KWH_FILE || join(DIR, "tuya.json"),
   TUYA_CONTROL: process.env.TUYA_CONTROL === "1",         // enable WRITE commands to the breaker (can cut the house)
+
+  // Grid-load alert (#1) + water-pump detection (#2 — Faisal 2.5HP, ~2kW, float-switch)
+  GRID_HIGH_W: num(process.env.GRID_HIGH_W, 1800),        // alert when breaker power exceeds this
+  PUMP_W: num(process.env.PUMP_W, 2000),                  // rated pump draw (2.5HP @ 220V/9A)
+  PUMP_STEP_W: num(process.env.PUMP_STEP_W, 1500),        // sudden load step that flags pump on/off
+  PUMP_ON_W: num(process.env.PUMP_ON_W, 1600),           // grid power that keeps the pump "running"
+  PUMP_MAX_RUN_MIN: num(process.env.PUMP_MAX_RUN_MIN, 45), // over-run → stuck-float / dry-run alert
+  PUMP_POLL_MIN: num(process.env.PUMP_POLL_MIN, 3),       // fast breaker poll for pump/grid detection
+  PUMP_FILE: process.env.PUMP_FILE || join(DIR, "pump.json"),
   HTTP_PORT: num(process.env.HTTP_PORT, 8080), // 0 disables the dashboard
   PUBLIC_URL: (process.env.PUBLIC_URL || "https://solar.skillmatch.tech").replace(/\/+$/, ""),
 };
@@ -466,6 +475,59 @@ function shouldFire(state, id) {
   const cooled = Date.now() - (state.lastAlerts[id] || 0) > CFG.ALERT_COOLDOWN_MIN * 60_000;
   if (cooled) state.lastAlerts[id] = Date.now();
   return cooled;
+}
+// Cooldown for the fast monitor (runs outside the daily state object)
+const monitorAlerts = {};
+function monitorCooldown(id, min) {
+  const now = Date.now();
+  if (now - (monitorAlerts[id] || 0) > min * 60_000) { monitorAlerts[id] = now; return true; }
+  return false;
+}
+
+// ---------- WATER PUMP DETECTION (unmetered — inferred from breaker load) ----------
+// The Faisal 2.5HP pump draws ~2kW and cycles on a float switch. We can't read it
+// directly, so we detect its on/off STEP in the breaker power and track runtime.
+let pumpState = null;
+function loadPump() {
+  if (!pumpState) pumpState = loadJson(CFG.PUMP_FILE,
+    { on: false, since: 0, lastP: 0, lastT: 0, curRun: 0, runMin: 0, energyWh: 0, date: "", overAlerted: false, runs: [] });
+  const today = nowParts().date;
+  if (pumpState.date !== today) { pumpState.date = today; pumpState.runMin = 0; pumpState.energyWh = 0; }
+  return pumpState;
+}
+function detectPump(P, now) {
+  const p = loadPump();
+  const dt = p.lastT ? (now - p.lastT) / 60_000 : 0;   // minutes since last sample
+  const delta = P - (p.lastP || 0);
+  if (p.on) {
+    p.runMin += dt; p.energyWh += CFG.PUMP_W * (dt / 60); p.curRun += dt;
+    if (p.curRun > CFG.PUMP_MAX_RUN_MIN && !p.overAlerted) {
+      sendAlert(`🟠 WATER PUMP running ${Math.round(p.curRun)} min\nUnusually long — the float switch may be stuck, the tank overflowing, or the bore running dry. Check the pump.`);
+      p.overAlerted = true;
+    }
+    if (delta <= -CFG.PUMP_STEP_W || P < CFG.PUMP_ON_W * 0.6) {   // pump stopped
+      p.runs.push({ start: p.since, end: now, min: Math.round(p.curRun) });
+      while (p.runs.length > 50) p.runs.shift();
+      p.on = false; p.curRun = 0; p.overAlerted = false;
+    }
+  } else if (delta >= CFG.PUMP_STEP_W && P >= CFG.PUMP_ON_W) {    // pump started
+    p.on = true; p.since = now; p.curRun = 0; p.overAlerted = false;
+  }
+  p.lastP = P; p.lastT = now;
+  saveJson(CFG.PUMP_FILE, p);
+}
+
+// Fast breaker monitor: high-grid-load alert (#1) + pump detection (#2)
+async function pumpMonitor() {
+  if (!CFG.TUYA_ID || !CFG.TUYA_DEVICE) return;
+  let tp;
+  try { const st = await tuyaStatus(); if (!st) return; tp = tuyaParse(st); latest.tuya = { ...tp, ts: Date.now() }; latest.tuyaErr = null; }
+  catch (e) { latest.tuyaErr = e.message; return; }
+  const P = tp.power;
+  if (P == null) return;
+  if (P >= CFG.GRID_HIGH_W && monitorCooldown("grid_high", CFG.ALERT_COOLDOWN_MIN))
+    await sendAlert(`🟠 HIGH GRID LOAD: ${(P / 1000).toFixed(2)} kW on the breaker (WAPDA)\n${P >= CFG.PUMP_ON_W ? "Likely the water pump or ACs on grid." : "Heavy load on utility."}`);
+  detectPump(P, Date.now());
 }
 
 // ---------- METER BUDGETS (rule 8) ----------
@@ -933,6 +995,10 @@ async function statusPayload() {
     tuya: latest.tuya || null, tuyaErr: latest.tuyaErr || null, tuyaRole: CFG.TUYA_ROLE,
     tuyaControl: CFG.TUYA_CONTROL,
     gridDirectW: gridDirectNow, totalW: s ? Math.round(s.load_w + gridDirectNow) : 0,
+    pump: (() => { const p = loadPump(); return {
+      on: p.on, curRunMin: p.on ? Math.round((Date.now() - p.since) / 60_000) : 0,
+      runMinToday: Math.round(p.runMin), energyToday: +(p.energyWh / 1000).toFixed(2),
+      lastRun: p.runs.length ? p.runs[p.runs.length - 1] : null, ratedW: CFG.PUMP_W }; })(),
     today: loadJson(CFG.STATE_FILE, null),
     history: history.filter(p => p.t > Date.now() - 48 * 3600_000),
     days: loadJson(CFG.DAYS_FILE, []).slice(-180),
@@ -1220,13 +1286,16 @@ tr:last-child td{border-bottom:none}
 <section><h2>FESCO Meters <span id="mcycle" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
 <div class="grid" id="meters"><div class="empty">Loading…</div></div></section>
 
-<section><h2>Decision Support</h2><div class="g2">
+<section><h2>Decision Support</h2><div class="grid">
   <div class="card"><div class="k">Loadshedding</div>
     <div class="v" id="out_v" style="font-size:22px">—</div>
     <div class="sub" id="out_sub">tracking grid outages via grid voltage</div></div>
   <div class="card"><div class="k">Net-Metering Case</div>
     <div class="v" id="nm_v" style="font-size:22px">—</div>
     <div class="sub" id="nm_sub">curtailed solar the grid could be buying</div></div>
+  <div class="card" id="pump_card" style="display:none"><div class="k">Water Pump (inferred)</div>
+    <div class="v" id="pump_v" style="font-size:22px">—</div>
+    <div class="sub" id="pump_sub">detected from the ~2kW grid-load signature</div></div>
 </div></section>
 
 
@@ -1593,6 +1662,13 @@ async function load(){
     el('nm_sub').textContent = 'last ' + d.netMetering.nDays + 'd · ≈ Rs ' +
       d.netMetering.rsYear.toLocaleString() + '/yr at Rs ' + d.cfg.nmExportRs + '/unit export';
   }
+  if (d.pump){
+    el('pump_card').style.display = '';
+    el('pump_v').innerHTML = d.pump.on
+      ? '<span style="color:var(--warn)">⚙️ RUNNING ' + d.pump.curRunMin + ' min</span>' : 'idle';
+    el('pump_sub').textContent = 'today: ' + d.pump.runMinToday + ' min · ~' + d.pump.energyToday + ' kWh' +
+      (d.pump.lastRun ? ' · last run ' + d.pump.lastRun.min + ' min' : '');
+  }
 
   if (d.today){
     drawPie([
@@ -1823,3 +1899,9 @@ if (CFG.HTTP_PORT > 0) {
 console.log(`Solar Watchdog v2 — every ${CFG.POLL_MINUTES} min | site ${CFG.LAT},${CFG.LON} | array ${CFG.KWP_W}W`);
 poll();
 setInterval(poll, CFG.POLL_MINUTES * 60_000);
+
+// Fast breaker monitor (high-grid alert + pump detection) on its own cadence
+if (CFG.TUYA_ID && CFG.TUYA_DEVICE) {
+  pumpMonitor();
+  setInterval(pumpMonitor, CFG.PUMP_POLL_MIN * 60_000);
+}
