@@ -532,33 +532,52 @@ async function pumpMonitor() {
 
 // ---------- METER BUDGETS (rule 8) ----------
 // 4 FESCO meters, billing cycle 7th→7th, 200 units = protected/unprotected cliff.
-// FESCO account identity per meter (from the June-26 bills) — backfilled onto
-// meters.json so the reference numbers show on the cards without a manual edit.
+// FESCO account identity, billed-units history, and bill-boundary readings per
+// meter (from the June-26 + July-26 bills). This is the source of truth — synced
+// onto meters.json each load so cards + streaks are correct on the server too.
+// NOTE (Jul-26 bills): Usman LOST protected status (231u > 200). All 4 unprotected.
 const METER_META = {
-  usman:  { ref: "05 13214 0285107 U", consumer: "1135315061", sp: "6660224" },
-  razia:  { ref: "05 13214 0310650 U", consumer: "1135315062", sp: "6660225" },
-  hamid:  { ref: "05 13214 0310600 U", consumer: "1130358097", sp: "478480" },
-  majeed: { ref: "05 13214 0285109 U", consumer: "1130263446", sp: "72973" },
+  usman: { ref: "05 13214 0285107 U", consumer: "1135315061", sp: "6660224", protected: false, budget: 200,
+    hist: { "2025-06": 214, "2025-07": 0, "2025-08": 142, "2025-09": 345, "2025-10": 238, "2025-11": 105, "2025-12": 172, "2026-01": 6, "2026-02": 191, "2026-03": 186, "2026-04": 149, "2026-05": 77, "2026-06": 162, "2026-07": 231 },
+    reads: { "2026-06-07": 4447, "2026-07-07": 4678 } },
+  majeed: { ref: "05 13214 0285109 U", consumer: "1130263446", sp: "72973", protected: false, budget: 200,
+    hist: { "2025-06": 220, "2025-07": 458, "2025-08": 91, "2025-09": 152, "2025-10": 206, "2025-11": 214, "2025-12": 113, "2026-01": 237, "2026-02": 231, "2026-03": 123, "2026-04": 11, "2026-05": 23, "2026-06": 1, "2026-07": 192 },
+    reads: { "2026-06-07": 50774, "2026-07-07": 50966 } },
+  razia: { ref: "05 13214 0310650 U", consumer: "1135315062", sp: "6660225", protected: false, budget: 200,
+    hist: { "2025-06": 197, "2025-07": 43, "2025-08": 214, "2025-09": 114, "2025-10": 157, "2025-11": 111, "2025-12": 24, "2026-01": 289, "2026-02": 235, "2026-03": 33, "2026-04": 207, "2026-05": 145, "2026-06": 308, "2026-07": 261 },
+    reads: { "2026-06-07": 4866, "2026-07-07": 5127 } },
+  hamid: { ref: "05 13214 0310600 U", consumer: "1130358097", sp: "478480", protected: false, budget: 200,
+    hist: { "2025-06": 105, "2025-07": 253, "2025-08": 156, "2025-09": 79, "2025-10": 111, "2025-11": 126, "2025-12": 96, "2026-01": 31, "2026-02": 129, "2026-03": 46, "2026-04": 80, "2026-05": 287, "2026-06": 351, "2026-07": 184 },
+    reads: { "2026-06-07": 62439, "2026-07-07": 62623 } },
 };
 function loadMeters() {
   let db = loadJson(CFG.METERS_FILE, null);
   if (!db) {
     db = { meters: [
-      { id: "usman",  name: "Usman",  protected: true,  budget: 180 },
-      { id: "razia",  name: "Razia",  protected: false, budget: 200 },
-      { id: "hamid",  name: "Hamid",  protected: false, budget: 200 },
-      { id: "majeed", name: "Majeed", protected: false, budget: 200 },
+      { id: "usman",  name: "Usman" },
+      { id: "razia",  name: "Razia" },
+      { id: "hamid",  name: "Hamid" },
+      { id: "majeed", name: "Majeed" },
     ], readings: [] };
-    saveJson(CFG.METERS_FILE, db);
   }
   if (!db.activeLog) db.activeLog = []; // changeover rotation history {meter, ts}
-  // backfill FESCO reference/consumer/serial onto existing meters
+  db.readings = db.readings || [];
+  // Sync identity / protected / budget / history / bill readings from METER_META
   let changed = false;
   for (const m of db.meters) {
-    const meta = METER_META[m.id];
-    if (meta && (m.ref !== meta.ref || !m.consumer)) { Object.assign(m, meta); changed = true; }
+    const meta = METER_META[m.id]; if (!meta) continue;
+    for (const k of ["ref", "consumer", "sp", "protected", "budget"])
+      if (m[k] !== meta[k]) { m[k] = meta[k]; changed = true; }
+    const hist = Object.entries(meta.hist).map(([month, units]) => ({ month, units }));
+    if (JSON.stringify(m.history) !== JSON.stringify(hist)) { m.history = hist; changed = true; }
+    for (const [date, val] of Object.entries(meta.reads)) {
+      const ts = new Date(`${date}T00:00:00${CFG.UTC_OFFSET}`).getTime();
+      if (!db.readings.some(r => r.meter === m.id && Math.abs(r.ts - ts) < 43_200_000)) {
+        db.readings.push({ meter: m.id, ts, value: val }); changed = true;
+      }
+    }
   }
-  if (changed) saveJson(CFG.METERS_FILE, db);
+  if (changed) { db.readings.sort((a, b) => a.ts - b.ts); saveJson(CFG.METERS_FILE, db); }
   return db;
 }
 
@@ -607,7 +626,7 @@ function computeMeters() {
     const rs = db.readings.filter(r => r.meter === m.id).sort((a, b) => a.ts - b.ts);
     const meas = sumFor(m.id, "meterMeasWh"), est = sumFor(m.id, "meterGridWh");
     const base = { id: m.id, name: m.name, protected: m.protected, budget: m.budget,
-      ref: m.ref || null, consumer: m.consumer || null,
+      ref: m.ref || null, consumer: m.consumer || null, sp: m.sp || null,
       active: m.id === active, est, meas, used_auto: meas > 0 ? meas : est,
       measured: meas > 0, prot: protectionEta(m) };
     if (!rs.length) return { ...base, noData: true };
@@ -1380,7 +1399,8 @@ function renderMeters(info){
         'style="background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:6px 9px;font-size:11px;cursor:pointer;white-space:nowrap">SET ACTIVE</button>';
     return '<div class="card"' + (m.active ? ' style="border-color:#2b5e46"' : '') + '><div class="k">' +
       m.name + (m.protected ? ' 🛡 protected' : '') + '</div>' +
-      (m.ref ? '<div class="sub" style="margin:-2px 0 8px;font-variant-numeric:tabular-nums">Ref ' + m.ref + '</div>' : '') + body +
+      (m.ref ? '<div class="sub" style="margin:-2px 0 8px;font-variant-numeric:tabular-nums">Ref ' + m.ref +
+        (m.sp ? ' · Meter S-P ' + m.sp : '') + '</div>' : '') + body +
       '<div style="display:flex;gap:6px;margin-top:10px">' +
       '<input id="mi_' + m.id + '" type="number" inputmode="numeric" placeholder="meter reading" ' +
       'style="flex:1;min-width:0;background:#0e141c;border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:6px 9px;font-size:13px">' +
