@@ -532,6 +532,14 @@ async function pumpMonitor() {
 
 // ---------- METER BUDGETS (rule 8) ----------
 // 4 FESCO meters, billing cycle 7th→7th, 200 units = protected/unprotected cliff.
+// FESCO account identity per meter (from the June-26 bills) — backfilled onto
+// meters.json so the reference numbers show on the cards without a manual edit.
+const METER_META = {
+  usman:  { ref: "05 13214 0285107 U", consumer: "1135315061", sp: "6660224" },
+  razia:  { ref: "05 13214 0310650 U", consumer: "1135315062", sp: "6660225" },
+  hamid:  { ref: "05 13214 0310600 U", consumer: "1130358097", sp: "478480" },
+  majeed: { ref: "05 13214 0285109 U", consumer: "1130263446", sp: "72973" },
+};
 function loadMeters() {
   let db = loadJson(CFG.METERS_FILE, null);
   if (!db) {
@@ -544,6 +552,13 @@ function loadMeters() {
     saveJson(CFG.METERS_FILE, db);
   }
   if (!db.activeLog) db.activeLog = []; // changeover rotation history {meter, ts}
+  // backfill FESCO reference/consumer/serial onto existing meters
+  let changed = false;
+  for (const m of db.meters) {
+    const meta = METER_META[m.id];
+    if (meta && (m.ref !== meta.ref || !m.consumer)) { Object.assign(m, meta); changed = true; }
+  }
+  if (changed) saveJson(CFG.METERS_FILE, db);
   return db;
 }
 
@@ -592,6 +607,7 @@ function computeMeters() {
     const rs = db.readings.filter(r => r.meter === m.id).sort((a, b) => a.ts - b.ts);
     const meas = sumFor(m.id, "meterMeasWh"), est = sumFor(m.id, "meterGridWh");
     const base = { id: m.id, name: m.name, protected: m.protected, budget: m.budget,
+      ref: m.ref || null, consumer: m.consumer || null,
       active: m.id === active, est, meas, used_auto: meas > 0 ? meas : est,
       measured: meas > 0, prot: protectionEta(m) };
     if (!rs.length) return { ...base, noData: true };
@@ -1363,7 +1379,8 @@ function renderMeters(info){
       : '<button data-m="' + m.id + '" onclick="setActive(this.dataset.m)" ' +
         'style="background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:6px 9px;font-size:11px;cursor:pointer;white-space:nowrap">SET ACTIVE</button>';
     return '<div class="card"' + (m.active ? ' style="border-color:#2b5e46"' : '') + '><div class="k">' +
-      m.name + (m.protected ? ' 🛡 protected' : '') + '</div>' + body +
+      m.name + (m.protected ? ' 🛡 protected' : '') + '</div>' +
+      (m.ref ? '<div class="sub" style="margin:-2px 0 8px;font-variant-numeric:tabular-nums">Ref ' + m.ref + '</div>' : '') + body +
       '<div style="display:flex;gap:6px;margin-top:10px">' +
       '<input id="mi_' + m.id + '" type="number" inputmode="numeric" placeholder="meter reading" ' +
       'style="flex:1;min-width:0;background:#0e141c;border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:6px 9px;font-size:13px">' +
