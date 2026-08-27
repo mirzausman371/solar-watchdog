@@ -1374,12 +1374,20 @@ function renderMeters(info){
       (m.perDay !== null && m.perDay !== undefined ? ' · ~' + m.perDay + ' u/day from readings' : '') + '</div>' : '';
     var prot = '';
     if (m.prot){
-      prot = m.protected
-        ? '<div class="sub" style="color:var(--ok)">🛡 protected · ' + m.prot.streak + ' clean bills — stay ≤ ' + m.budget + '</div>'
-        : '<div class="sub" style="color:' + (m.prot.streak > 0 ? 'var(--warn)' : 'var(--bad)') + '">' +
+      // this cycle counts as the next clean bill if it's projecting/pacing ≤ budget
+      var cycleClean = m.status ? m.status !== 'red' : (m.used_auto <= m.budget);
+      if (m.protected){
+        prot = '<div class="sub" style="color:var(--ok)">🛡 protected · stay ≤ ' + m.budget + '</div>';
+      } else if (m.prot.streak >= 6){
+        prot = '<div class="sub" style="color:var(--ok)">🛡 criteria met — 6 clean bills ✓ · protected at next bill</div>';
+      } else if (m.prot.streak === 5 && cycleClean && !m.prot.liveReset){
+        prot = '<div class="sub" style="color:var(--ok)">🛡 on track — keep this cycle ≤ ' + m.budget + ' to lock protection (5/6)</div>';
+      } else {
+        prot = '<div class="sub" style="color:' + (m.prot.streak > 0 ? 'var(--warn)' : 'var(--bad)') + '">' +
           '🛡 in ' + m.prot.needed + ' clean bill' + (m.prot.needed === 1 ? '' : 's') +
           ' (streak ' + m.prot.streak + '/6 · protected after ' + m.prot.eta + ' bill)' +
           (m.prot.liveReset ? ' — THIS cycle >200, streak resets' : '') + '</div>';
+      }
     }
     var body;
     if (m.noData){
@@ -1398,7 +1406,7 @@ function renderMeters(info){
       : '<button data-m="' + m.id + '" onclick="setActive(this.dataset.m)" ' +
         'style="background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:6px 9px;font-size:11px;cursor:pointer;white-space:nowrap">SET ACTIVE</button>';
     return '<div class="card"' + (m.active ? ' style="border-color:#2b5e46"' : '') + '><div class="k">' +
-      m.name + (m.protected ? ' 🛡 protected' : '') + '</div>' +
+      m.name + (m.protected ? ' 🛡 protected' : (m.prot && m.prot.streak >= 6 ? ' 🛡 criteria met' : '')) + '</div>' +
       (m.ref ? '<div class="sub" style="margin:-2px 0 8px;font-variant-numeric:tabular-nums">Ref ' + m.ref +
         (m.sp ? ' · Meter S-P ' + m.sp : '') + '</div>' : '') + body +
       '<div style="display:flex;gap:6px;margin-top:10px">' +
