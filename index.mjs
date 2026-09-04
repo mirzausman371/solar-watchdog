@@ -91,6 +91,9 @@ const CFG = {
   PUMP_MAX_RUN_MIN: num(process.env.PUMP_MAX_RUN_MIN, 45), // over-run → stuck-float / dry-run alert
   PUMP_POLL_MIN: num(process.env.PUMP_POLL_MIN, 3),       // fast breaker poll for pump/grid detection
   PUMP_FILE: process.env.PUMP_FILE || join(DIR, "pump.json"),
+
+  // FESCO auto-fetch — pull each meter's latest bill from the PITC portal monthly
+  FESCO_AUTOFETCH: process.env.FESCO_AUTOFETCH !== "0",   // default on when meters have refs
   HTTP_PORT: num(process.env.HTTP_PORT, 8080), // 0 disables the dashboard
   PUBLIC_URL: (process.env.PUBLIC_URL || "https://solar.skillmatch.tech").replace(/\/+$/, ""),
 };
@@ -498,19 +501,25 @@ function loadPump() {
 function detectPump(P, now) {
   const p = loadPump();
   const dt = p.lastT ? (now - p.lastT) / 60_000 : 0;   // minutes since last sample
+  // Restart/gap guard: if we missed several polls (or just booted), don't
+  // accumulate the whole gap as pump runtime — that produced false 8-day runs.
+  const gap = dt <= 0 || dt > CFG.PUMP_POLL_MIN * 4;
   const delta = P - (p.lastP || 0);
   if (p.on) {
-    p.runMin += dt; p.energyWh += CFG.PUMP_W * (dt / 60); p.curRun += dt;
-    if (p.curRun > CFG.PUMP_MAX_RUN_MIN && !p.overAlerted) {
-      sendAlert(`🟠 WATER PUMP running ${Math.round(p.curRun)} min\nUnusually long — the float switch may be stuck, the tank overflowing, or the bore running dry. Check the pump.`);
-      p.overAlerted = true;
+    if (gap) { p.on = false; p.curRun = 0; p.overAlerted = false; }  // can't trust the run across a gap
+    else {
+      p.runMin += dt; p.energyWh += CFG.PUMP_W * (dt / 60); p.curRun += dt;
+      if (p.curRun > CFG.PUMP_MAX_RUN_MIN && !p.overAlerted) {
+        sendAlert(`🟠 WATER PUMP running ${Math.round(p.curRun)} min\nUnusually long — the float switch may be stuck, the tank overflowing, or the bore running dry. Check the pump.`);
+        p.overAlerted = true;
+      }
+      if (delta <= -CFG.PUMP_STEP_W || P < CFG.PUMP_ON_W * 0.6) {   // pump stopped
+        p.runs.push({ start: p.since, end: now, min: Math.round(p.curRun) });
+        while (p.runs.length > 50) p.runs.shift();
+        p.on = false; p.curRun = 0; p.overAlerted = false;
+      }
     }
-    if (delta <= -CFG.PUMP_STEP_W || P < CFG.PUMP_ON_W * 0.6) {   // pump stopped
-      p.runs.push({ start: p.since, end: now, min: Math.round(p.curRun) });
-      while (p.runs.length > 50) p.runs.shift();
-      p.on = false; p.curRun = 0; p.overAlerted = false;
-    }
-  } else if (delta >= CFG.PUMP_STEP_W && P >= CFG.PUMP_ON_W) {    // pump started
+  } else if (!gap && delta >= CFG.PUMP_STEP_W && P >= CFG.PUMP_ON_W) {    // pump started
     p.on = true; p.since = now; p.curRun = 0; p.overAlerted = false;
   }
   p.lastP = P; p.lastT = now;
@@ -538,17 +547,17 @@ async function pumpMonitor() {
 // NOTE (Jul-26 bills): Usman LOST protected status (231u > 200). All 4 unprotected.
 const METER_META = {
   usman: { ref: "05 13214 0285107 U", consumer: "1135315061", sp: "6660224", protected: false, budget: 200,
-    hist: { "2025-06": 214, "2025-07": 0, "2025-08": 142, "2025-09": 345, "2025-10": 238, "2025-11": 105, "2025-12": 172, "2026-01": 6, "2026-02": 191, "2026-03": 186, "2026-04": 149, "2026-05": 77, "2026-06": 162, "2026-07": 231 },
-    reads: { "2026-06-07": 4447, "2026-07-07": 4678 } },
+    hist: { "2025-06": 214, "2025-07": 0, "2025-08": 142, "2025-09": 345, "2025-10": 238, "2025-11": 105, "2025-12": 172, "2026-01": 6, "2026-02": 191, "2026-03": 186, "2026-04": 149, "2026-05": 77, "2026-06": 162, "2026-07": 231, "2026-08": 134 },
+    reads: { "2026-06-07": 4447, "2026-07-07": 4678, "2026-08-07": 4812 } },
   majeed: { ref: "05 13214 0285109 U", consumer: "1130263446", sp: "72973", protected: false, budget: 200,
-    hist: { "2025-06": 220, "2025-07": 458, "2025-08": 91, "2025-09": 152, "2025-10": 206, "2025-11": 214, "2025-12": 113, "2026-01": 237, "2026-02": 231, "2026-03": 123, "2026-04": 11, "2026-05": 23, "2026-06": 1, "2026-07": 192 },
-    reads: { "2026-06-07": 50774, "2026-07-07": 50966 } },
+    hist: { "2025-06": 220, "2025-07": 458, "2025-08": 91, "2025-09": 152, "2025-10": 206, "2025-11": 214, "2025-12": 113, "2026-01": 237, "2026-02": 231, "2026-03": 123, "2026-04": 11, "2026-05": 23, "2026-06": 1, "2026-07": 192, "2026-08": 171 },
+    reads: { "2026-06-07": 50774, "2026-07-07": 50966, "2026-08-07": 51137 } },
   razia: { ref: "05 13214 0310650 U", consumer: "1135315062", sp: "6660225", protected: false, budget: 200,
-    hist: { "2025-06": 197, "2025-07": 43, "2025-08": 214, "2025-09": 114, "2025-10": 157, "2025-11": 111, "2025-12": 24, "2026-01": 289, "2026-02": 235, "2026-03": 33, "2026-04": 207, "2026-05": 145, "2026-06": 308, "2026-07": 261 },
-    reads: { "2026-06-07": 4866, "2026-07-07": 5127 } },
+    hist: { "2025-06": 197, "2025-07": 43, "2025-08": 214, "2025-09": 114, "2025-10": 157, "2025-11": 111, "2025-12": 24, "2026-01": 289, "2026-02": 235, "2026-03": 33, "2026-04": 207, "2026-05": 145, "2026-06": 308, "2026-07": 261, "2026-08": 179 },
+    reads: { "2026-06-07": 4866, "2026-07-07": 5127, "2026-08-07": 5306 } },
   hamid: { ref: "05 13214 0310600 U", consumer: "1130358097", sp: "478480", protected: false, budget: 200,
-    hist: { "2025-06": 105, "2025-07": 253, "2025-08": 156, "2025-09": 79, "2025-10": 111, "2025-11": 126, "2025-12": 96, "2026-01": 31, "2026-02": 129, "2026-03": 46, "2026-04": 80, "2026-05": 287, "2026-06": 351, "2026-07": 184 },
-    reads: { "2026-06-07": 62439, "2026-07-07": 62623 } },
+    hist: { "2025-06": 105, "2025-07": 253, "2025-08": 156, "2025-09": 79, "2025-10": 111, "2025-11": 126, "2025-12": 96, "2026-01": 31, "2026-02": 129, "2026-03": 46, "2026-04": 80, "2026-05": 287, "2026-06": 351, "2026-07": 184, "2026-08": 183 },
+    reads: { "2026-06-07": 62439, "2026-07-07": 62623, "2026-08-07": 62806 } },
 };
 function loadMeters() {
   let db = loadJson(CFG.METERS_FILE, null);
@@ -654,6 +663,73 @@ function computeMeters() {
     return { ...base, used, projected, status, lastValue: last.value, lastTs: last.ts, midCycleBaseline: !before };
   });
   return { cycle, active, meters };
+}
+
+// ---------- FESCO AUTO-FETCH (monthly bill readings from the PITC portal) ----------
+const FESCO_BASE = "https://bill.pitc.com.pk/fescobill";
+const FESCO_MON = { JAN: "01", FEB: "02", MAR: "03", APR: "04", MAY: "05", JUN: "06", JUL: "07", AUG: "08", SEP: "09", OCT: "10", NOV: "11", DEC: "12" };
+const fescoField = (html, name) => { const m = html.match(new RegExp('name="' + name + '"[^>]*?value="([^"]*)"')); return m ? m[1] : ""; };
+
+// Scrape one bill by 14-digit reference → { present, units, month } or null.
+// The portal is ASP.NET WebForms, so we GET the form (cookies + tokens) then POST.
+async function fetchFescoBill(refDigits) {
+  const jar = {};
+  const grab = (res) => { const sc = res.headers.getSetCookie ? res.headers.getSetCookie() : []; for (const c of sc) { const kv = c.split(";")[0], i = kv.indexOf("="); if (i > 0) jar[kv.slice(0, i).trim()] = kv.slice(i + 1); } };
+  let res = await fetch(FESCO_BASE, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(25000) });
+  let html = await res.text(); grab(res);
+  const form = {
+    __EVENTTARGET: "", __EVENTARGUMENT: "", __LASTFOCUS: "",
+    __VIEWSTATE: fescoField(html, "__VIEWSTATE"), __VIEWSTATEGENERATOR: fescoField(html, "__VIEWSTATEGENERATOR"),
+    __EVENTVALIDATION: fescoField(html, "__EVENTVALIDATION"), __RequestVerificationToken: fescoField(html, "__RequestVerificationToken"),
+    rbSearchByList: "refno", searchTextBox: refDigits, ruCodeTextBox: "", btnSearch: "Search",
+  };
+  const body = Object.entries(form).map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v)).join("&");
+  res = await fetch(FESCO_BASE, { method: "POST", redirect: "follow", signal: AbortSignal.timeout(25000),
+    headers: { "User-Agent": "Mozilla/5.0", "Content-Type": "application/x-www-form-urlencoded", "Referer": FESCO_BASE,
+      Cookie: Object.entries(jar).map(([k, v]) => k + "=" + v).join("; ") }, body });
+  html = await res.text();
+  if (!html.includes(refDigits)) return null; // not a valid bill page
+  const txt = html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ");
+  const pr = txt.match(/PRESENT READING[^\d]*(\d+)\s*UNITS[^\d]*(\d+)/i);
+  const mo = txt.match(/BILL MONTH[^A-Za-z]*([A-Za-z]{3})\s*(\d{2})/i);
+  if (!pr || !mo || !FESCO_MON[mo[1].toUpperCase()]) return null;
+  return { present: Number(pr[1]), units: Number(pr[2]), month: `20${mo[2]}-${FESCO_MON[mo[1].toUpperCase()]}` };
+}
+
+let fescoLastRun = 0;
+// Fetch every meter's latest bill; add new month readings + history; alert on change.
+async function fescoAutoFetch(force) {
+  if (!CFG.FESCO_AUTOFETCH && !force) return { updated: 0 };
+  const db = loadMeters();
+  let changed = false; const added = [];
+  for (const m of db.meters) {
+    if (!m.ref) continue;
+    let bill;
+    try { bill = await fetchFescoBill(m.ref.replace(/\D/g, "")); }
+    catch (e) { console.error(`fesco ${m.id}:`, e.message); continue; }
+    if (!bill) continue;
+    m.history = m.history || [];
+    const h = m.history.find(x => x.month === bill.month);
+    if (h) { if (h.units !== bill.units) { h.units = bill.units; changed = true; } }
+    else { m.history.push({ month: bill.month, units: bill.units }); changed = true; }
+    const ts = new Date(`${bill.month}-07T00:00:00${CFG.UTC_OFFSET}`).getTime();
+    if (!db.readings.some(r => r.meter === m.id && Math.abs(r.ts - ts) < 43_200_000)) {
+      db.readings.push({ meter: m.id, ts, value: bill.present });
+      added.push(`${m.name}: ${bill.present} (${bill.units}u, ${bill.month})`);
+      changed = true;
+    }
+  }
+  if (changed) {
+    db.readings.sort((a, b) => a.ts - b.ts);
+    saveJson(CFG.METERS_FILE, db);
+    if (added.length) {
+      const info = computeMeters();
+      const prot = info.meters.map(x => x.prot ? `${x.name} ${x.prot.streak >= 6 ? "PROTECTED ✓" : x.prot.streak + "/6"}` : x.name).join(", ");
+      await sendAlert(`🧾 NEW FESCO BILL(S) auto-fetched\n${added.join("\n")}\nProtection: ${prot}`);
+    }
+  }
+  fescoLastRun = Date.now();
+  return { updated: added.length, added };
 }
 
 // ---------- PAYBACK / PR TREND / BATTERY HEALTH ----------
@@ -1031,7 +1107,7 @@ async function statusPayload() {
     tuyaControl: CFG.TUYA_CONTROL,
     gridDirectW: gridDirectNow, totalW: s ? Math.round(s.load_w + gridDirectNow) : 0,
     pump: (() => { const p = loadPump(); return {
-      on: p.on, curRunMin: p.on ? Math.round((Date.now() - p.since) / 60_000) : 0,
+      on: p.on, curRunMin: p.on ? Math.round(p.curRun || 0) : 0,
       runMinToday: Math.round(p.runMin), energyToday: +(p.energyWh / 1000).toFixed(2),
       lastRun: p.runs.length ? p.runs[p.runs.length - 1] : null, ratedW: CFG.PUMP_W }; })(),
     today: loadJson(CFG.STATE_FILE, null),
@@ -1318,8 +1394,10 @@ tr:last-child td{border-bottom:none}
   </div>
 </div></section>
 
-<section><h2>FESCO Meters <span id="mcycle" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
-<div class="grid" id="meters"><div class="empty">Loading…</div></div></section>
+<section><h2>FESCO Meters <span id="mcycle" style="text-transform:none;letter-spacing:0;font-weight:400"></span>
+  <button class="tbtn" style="float:right;margin-top:-2px" onclick="fetchBills(this)">⟳ Fetch latest bills</button></h2>
+<div class="grid" id="meters"><div class="empty">Loading…</div></div>
+<div class="sub" id="fesco_msg" style="margin-top:8px"></div></section>
 
 <section><h2>Decision Support</h2><div class="grid">
   <div class="card"><div class="k">Loadshedding</div>
@@ -1457,6 +1535,19 @@ async function setActive(id){
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ meter: id }) });
   load();
+}
+
+async function fetchBills(btn){
+  var msg = el('fesco_msg'); if (msg) msg.textContent = 'fetching from FESCO… (takes ~20s)';
+  if (btn) btn.disabled = true;
+  try {
+    var r = await fetch('/api/fesco/fetch', { method: 'POST' });
+    var j = await r.json();
+    if (j.error) { if (msg) msg.textContent = '⚠️ ' + j.error; }
+    else if (j.updated) { if (msg) msg.textContent = '✅ ' + j.updated + ' new: ' + j.added.join(', '); load(); }
+    else { if (msg) msg.textContent = 'No new bills — already up to date.'; }
+  } catch(e){ if (msg) msg.textContent = '⚠️ ' + e.message; }
+  if (btn) btn.disabled = false;
 }
 
 async function breakerCmd(action, value, confirmMsg){
@@ -1891,6 +1982,11 @@ if (CFG.HTTP_PORT > 0) {
         return res.end(JSON.stringify({ ok: true, note }));
       } catch (e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
     }
+    if (req.method === "POST" && req.url.startsWith("/api/fesco/fetch")) {
+      res.setHeader("Content-Type", "application/json");
+      try { const r = await fescoAutoFetch(true); return res.end(JSON.stringify(r)); }
+      catch (e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
+    }
     if (req.method === "POST" && req.url.startsWith("/api/meter/active")) {
       res.setHeader("Content-Type", "application/json");
       try {
@@ -1949,4 +2045,11 @@ setInterval(poll, CFG.POLL_MINUTES * 60_000);
 if (CFG.TUYA_ID && CFG.TUYA_DEVICE) {
   pumpMonitor();
   setInterval(pumpMonitor, CFG.PUMP_POLL_MIN * 60_000);
+}
+
+// FESCO auto-fetch: check daily for new monthly bills (idempotent — captures
+// whatever the latest available bill is, keyed by the bill's own month).
+if (CFG.FESCO_AUTOFETCH) {
+  setTimeout(() => fescoAutoFetch().then(r => r.updated && console.log(`FESCO: ${r.updated} new bill(s)`)).catch(e => console.error("fesco:", e.message)), 60_000);
+  setInterval(() => fescoAutoFetch().catch(e => console.error("fesco:", e.message)), 24 * 3600_000);
 }
