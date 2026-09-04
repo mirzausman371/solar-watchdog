@@ -92,8 +92,11 @@ const CFG = {
   PUMP_POLL_MIN: num(process.env.PUMP_POLL_MIN, 3),       // fast breaker poll for pump/grid detection
   PUMP_FILE: process.env.PUMP_FILE || join(DIR, "pump.json"),
 
-  // FESCO auto-fetch — pull each meter's latest bill from the PITC portal monthly
-  FESCO_AUTOFETCH: process.env.FESCO_AUTOFETCH !== "0",   // default on when meters have refs
+  // FESCO auto-fetch — pull each meter's latest bill from the PITC portal monthly.
+  // PITC blocks non-Pakistani IPs, so the cloud server can't fetch directly; a
+  // Mac/home fetcher on a PK IP pushes to /api/fesco/ingest with FESCO_PUSH_TOKEN.
+  FESCO_AUTOFETCH: process.env.FESCO_AUTOFETCH !== "0",   // server-side fetch (off on a foreign VPS)
+  FESCO_PUSH_TOKEN: process.env.FESCO_PUSH_TOKEN || "",   // shared secret for pushed readings
   HTTP_PORT: num(process.env.HTTP_PORT, 8080), // 0 disables the dashboard
   PUBLIC_URL: (process.env.PUBLIC_URL || "https://solar.skillmatch.tech").replace(/\/+$/, ""),
 };
@@ -697,21 +700,21 @@ async function fetchFescoBill(refDigits) {
 }
 
 let fescoLastRun = 0;
-// Fetch every meter's latest bill; add new month readings + history; alert on change.
-async function fescoAutoFetch(force) {
-  if (!CFG.FESCO_AUTOFETCH && !force) return { updated: 0 };
+// Apply a set of bills (fetched here or pushed from a PK-IP relay) to meters.json.
+async function applyFescoBills(bills) {
   const db = loadMeters();
   let changed = false; const added = [];
-  for (const m of db.meters) {
-    if (!m.ref) continue;
-    let bill;
-    try { bill = await fetchFescoBill(m.ref.replace(/\D/g, "")); }
-    catch (e) { console.error(`fesco ${m.id}:`, e.message); continue; }
-    if (!bill) continue;
+  for (const bill of bills) {
+    if (!bill || !bill.month || !(bill.present > 0)) continue;
+    const refDigits = String(bill.ref || "").replace(/\D/g, "");
+    const m = db.meters.find(x => x.id === bill.meterId || (x.ref && x.ref.replace(/\D/g, "") === refDigits));
+    if (!m) continue;
     m.history = m.history || [];
     const h = m.history.find(x => x.month === bill.month);
-    if (h) { if (h.units !== bill.units) { h.units = bill.units; changed = true; } }
-    else { m.history.push({ month: bill.month, units: bill.units }); changed = true; }
+    if (bill.units != null) {
+      if (h) { if (h.units !== bill.units) { h.units = bill.units; changed = true; } }
+      else { m.history.push({ month: bill.month, units: bill.units }); changed = true; }
+    }
     const ts = new Date(`${bill.month}-07T00:00:00${CFG.UTC_OFFSET}`).getTime();
     if (!db.readings.some(r => r.meter === m.id && Math.abs(r.ts - ts) < 43_200_000)) {
       db.readings.push({ meter: m.id, ts, value: bill.present });
@@ -725,11 +728,22 @@ async function fescoAutoFetch(force) {
     if (added.length) {
       const info = computeMeters();
       const prot = info.meters.map(x => x.prot ? `${x.name} ${x.prot.streak >= 6 ? "PROTECTED ✓" : x.prot.streak + "/6"}` : x.name).join(", ");
-      await sendAlert(`🧾 NEW FESCO BILL(S) auto-fetched\n${added.join("\n")}\nProtection: ${prot}`);
+      await sendAlert(`🧾 NEW FESCO BILL(S)\n${added.join("\n")}\nProtection: ${prot}`);
     }
   }
-  fescoLastRun = Date.now();
   return { updated: added.length, added };
+}
+// Server-side fetch (works only from a Pakistani IP).
+async function fescoAutoFetch(force) {
+  if (!CFG.FESCO_AUTOFETCH && !force) return { updated: 0 };
+  const bills = [];
+  for (const m of loadMeters().meters) {
+    if (!m.ref) continue;
+    try { const b = await fetchFescoBill(m.ref.replace(/\D/g, "")); if (b) bills.push({ meterId: m.id, ...b }); }
+    catch (e) { console.error(`fesco ${m.id}:`, e.message); }
+  }
+  fescoLastRun = Date.now();
+  return applyFescoBills(bills);
 }
 
 // ---------- PAYBACK / PR TREND / BATTERY HEALTH ----------
@@ -1941,6 +1955,18 @@ if (CFG.HTTP_PORT > 0) {
         }
         res.statusCode = 401;
         return res.end(JSON.stringify({ error: "wrong password" }));
+      } catch (e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
+    }
+    // Token-authed reading push from a PK-IP relay (no dashboard cookie needed)
+    if (req.method === "POST" && req.url.startsWith("/api/fesco/ingest")) {
+      res.setHeader("Content-Type", "application/json");
+      try {
+        const p = JSON.parse(await readBody(req) || "{}");
+        if (!CFG.FESCO_PUSH_TOKEN || p.token !== CFG.FESCO_PUSH_TOKEN) {
+          res.statusCode = 401; return res.end(JSON.stringify({ error: "bad or missing token" }));
+        }
+        const r = await applyFescoBills(Array.isArray(p.bills) ? p.bills : []);
+        return res.end(JSON.stringify(r));
       } catch (e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
     }
     if (req.url.startsWith("/manifest.json") || req.url.startsWith("/sw.js") || req.url.startsWith("/icon.svg")) {
